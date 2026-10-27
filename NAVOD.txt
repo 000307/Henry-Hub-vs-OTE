@@ -1,0 +1,58 @@
+Sekce 4 Forward – upravený celý skript
+
+Soubor henry_hub_ote_forward.py nahrazuje původní skript. Původní vstupní
+Excely a sekce 1–3 používá stejně jako dříve; nově přidává CME Forward.
+
+Spuštění na počítači s Pythonem 3.10 nebo novějším:
+
+  pip install numpy pandas openpyxl plotly statsmodels scipy pillow
+  python henry_hub_ote_forward.py
+
+Ve stejné složce ponechte původní soubory:
+  Spot plynu - HH.xlsx
+  spotové ceny OTE - plyn.xlsx
+  USD to EUR.xlsx
+
+Skript vygeneruje původní HTML report a otevře jej přes lokální adresu
+http://127.0.0.1:… vypsanou v terminálu. Python nechte běžet; ukončení Ctrl+C.
+Pokud se prohlížeč neotevře, zkopírujte vypsanou adresu do prohlížeče.
+
+Sekce 4 Forward:
+- Month na ose X je měsíc dodání kontraktu, řazený chronologicky.
+- Settle na ose Y je vypořádací cena CME v USD/MMBtu.
+- Ceny zůstávají v jednotce a měně CME. Přepínače v záhlaví patří sekcím 1–3.
+- Data se kontrolují při spuštění a poté každých 5 minut při otevřeném reportu.
+- Tlačítko Obnovit data respektuje pětiminutovou cache serveru.
+- Datum vypořádání a časy kontroly/úspěšného načtení jsou uvedeny odděleně.
+- Settle jsou denní vypořádací ceny; nové ceny závisejí na publikaci CME.
+- Chybějící ceny se vynechají. Výpadek ponechá poslední úspěšná data a zobrazí stav.
+- Poslední data se ukládají vedle HTML do souboru *.forward-cache.json.
+- Graf lze zahrnout do stávajícího exportu PDF; Excel export odpovídá sekci 3.
+
+Samostatně otevřené HTML (dvojklikem) zobrazuje snímek z doby generování.
+Automatické aktualizace fungují přes běžící lokální Python server.
+
+Volitelné parametry:
+  --no-serve       Pouze vygenerovat HTML se snímkem, pak skript ukončit.
+  --no-browser     Neotevírat automaticky prohlížeč.
+  --port 8765      Použít konkrétní port; výchozí je automaticky volný port.
+  --input "..."    Cesta k Excelu Henry Hub.
+  --ote-input "..." Cesta k Excelu OTE.
+  --fx-input "..." Cesta ke kurzovému Excelu.
+  --output "..."   Cesta k výstupnímu HTML.
+
+V místním Jupyteru běží server na pozadí po dobu běhu kernelu.
+V Colabu nebo vzdáleném notebooku je navíc nutné přesměrování portu;
+nejjednodušší je spustit skript místně na počítači.
+
+Zdroj:
+https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html
+
+Ověření a omezení:
+Prošlo 15 testů zpracování odpovědí CME a cache. Generování HTML z testovacích
+Excelů a automatické aktualizace, zachování dat při výpadku i původní ovládání
+byly ověřeny v prohlížeči Chromium na vzorových odpovědích. Síť tohoto prostředí neumožňuje živý přístup k CME, proto aktuální
+funkčnost endpointů CME a skutečná tržní data nebyly živě ověřeny. Loader používá
+webové JSON rozhraní CME pro produkt 444. Pokud CME změní rozhraní nebo odmítne
+přístup, sekce zobrazí chybu a ponechá poslední data. Původní vstupní Excely nebyly
+součástí přílohy; celý tok byl ověřen na testovacích souborech.
