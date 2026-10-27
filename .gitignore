@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.xlsx
+*.xls
+*.forward-cache.json
+henry_hub_ote_interaktivni_analyza.html
