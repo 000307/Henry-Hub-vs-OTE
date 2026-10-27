@@ -1,5 +1,5 @@
 # Python 3.10+; pip install numpy pandas openpyxl plotly statsmodels scipy pillow
-# Automatické CME aktualizace: spusťte skript a otevřete vypsanou lokální URL.
+# Data CME se načítají jednou při vytvoření HTML reportu.
 # První listy: HH, OTE, USD to EUR.xlsx. Logo je vloženo přímo do skriptu.
 from __future__ import annotations
 
@@ -21,16 +21,8 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 from scipy.optimize import least_squares
 
 
-import copy
-import json
-import math
-import os
 import re
-import tempfile
-import threading
-import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -251,158 +243,21 @@ def fetch_cme_forward(request_json=_forward_json) -> dict:
     raise RuntimeError("Data CME se nepodařilo načíst. " + errors[0][:250])
 
 
-class ForwardStore:
-    """Throttled loader retaining its last valid snapshot on download failure."""
-    def __init__(self, snapshot_path: Path, refresh_seconds: int = 300, fetcher=None):
-        self.snapshot_path = Path(snapshot_path)
-        self.refresh_seconds = max(1, int(refresh_seconds))
-        self.fetcher = fetcher or fetch_cme_forward
-        self._lock = threading.Lock()
-        self._last_attempt = None
-        self._good = None
-        self._error = None
-        self._checked_at = None
-        try:
-            saved = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
-            self._good = self._validate_snapshot(saved)
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
-
-    @staticmethod
-    def _validate_snapshot(payload: dict) -> dict:
-        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
-            raise ValueError("Forward snapshot nemá platnou strukturu.")
-        rows = parse_cme_forward_rows(payload["rows"])
-        result = {"rows": rows, "trade_date": _forward_date(payload["trade_date"]).isoformat(),
-                  "update_time": str(payload.get("update_time", "")),
-                  "fetched_at": str(payload.get("fetched_at", "")),
-                  "source_url": CME_FORWARD_SOURCE}
-        return result
-
-    def _payload(self) -> dict:
-        result = copy.deepcopy(self._good) if self._good else {
-            "rows": [], "trade_date": None, "update_time": "", "fetched_at": None,
-            "source_url": CME_FORWARD_SOURCE}
-        result.update(checked_at=self._checked_at, stale=bool(self._error or self._last_attempt is None),
-                      error=self._error)
-        return result
-
-    def peek(self) -> dict:
-        with self._lock:
-            return self._payload()
-
-    def get(self) -> dict:
-        with self._lock:
-            now = time.monotonic()
-            if self._last_attempt is not None and now - self._last_attempt < self.refresh_seconds:
-                return self._payload()
-            self._last_attempt = now
-            self._checked_at = _forward_timestamp()
-            try:
-                incoming = self._validate_snapshot(self.fetcher())
-                incoming["fetched_at"] = self._checked_at
-                # A newer curve must never be silently replaced with an older report.
-                if self._good and incoming["trade_date"] < self._good["trade_date"]:
-                    raise ValueError("CME vrátilo starší datum; ponechávám poslední platnou křivku.")
-                self._good = incoming
-                self._error = None
-                self._save()
-            except Exception as exc:
-                self._error = str(exc)[:500] or type(exc).__name__
-            return self._payload()
-
-    def _save(self) -> None:
-        # Disk failures must not discard a successful in-memory refresh.
-        temporary = None
-        try:
-            self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.snapshot_path.parent,
-                                             prefix=".forward-", suffix=".tmp", delete=False) as stream:
-                temporary = Path(stream.name)
-                json.dump(self._good, stream, ensure_ascii=False, allow_nan=False)
-            os.replace(temporary, self.snapshot_path)
-        except OSError:
-            if temporary:
-                temporary.unlink(missing_ok=True)
-
-
-# Lokální server zpřístupní pouze report a data Forward, žádné vstupní soubory.
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
-import threading
-import webbrowser
-
-
-def create_report_server(output: Path, forward_store, port: int = 0) -> ThreadingHTTPServer:
-    report_path = output.resolve()
-
-    class ReportHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            allowed_hosts = {f"127.0.0.1:{self.server.server_port}",
-                             f"localhost:{self.server.server_port}"}
-            if self.headers.get("Host", "") not in allowed_hosts:
-                self.send_error(403)
-                return
-            route = urlsplit(self.path).path
-            if route == "/api/forward":
-                body = json.dumps(forward_store.get(), ensure_ascii=False, allow_nan=False).encode("utf-8")
-                content_type = "application/json; charset=utf-8"
-            elif route in {"/", "/report.html"}:
-                body = report_path.read_bytes()
-                content_type = "text/html; charset=utf-8"
-            else:
-                self.send_error(404)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-        def log_message(self, format, *args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", port), ReportHandler)
-    server.daemon_threads = True
-    return server
-
-
-# V notebooku musí zůstat reference na server a obslužné vlákno.
-_report_server = None
-
-
-def run_report_server(output: Path, forward_store, port: int = 0, open_browser: bool = True) -> None:
-    global _report_server
-    if _report_server is not None:
-        _report_server.shutdown()
-        _report_server.server_close()
-    server = create_report_server(output, forward_store, port)
-    _report_server = server
-    url = f"http://127.0.0.1:{server.server_port}/"
-    print(f"Report s automatickou aktualizací Forward: {url}")
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    if open_browser:
-        try:
-            webbrowser.open(url)
-        except webbrowser.Error:
-            pass
-    if "ipykernel" not in sys.modules:
-        print("Pro aktualizace ponechte skript spuštěný. Ukončení: Ctrl+C.")
-        try:
-            while thread.is_alive():
-                thread.join(0.5)
-        except KeyboardInterrupt:
-            print("\nServer ukončen.")
-        finally:
-            server.shutdown()
-            server.server_close()
-            _report_server = None
+def load_forward_for_report() -> dict[str, Any]:
+    """Načte aktuální CME data jednou pro tento report, bez diskové cache."""
+    try:
+        data = fetch_cme_forward()
+        return {
+            "rows": parse_cme_forward_rows(data["rows"]),
+            "trade_date": _forward_date(data["trade_date"]).isoformat(),
+            "fetched_at": _forward_timestamp(),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "rows": [], "trade_date": None, "fetched_at": None,
+            "error": str(exc)[:500] or type(exc).__name__,
+        }
 
 
 # Vstupní a výstupní soubory
@@ -1431,10 +1286,10 @@ def make_html(
     comparison: pd.DataFrame,
     output: Path,
     eur: dict[str, Any],
-    forward_snapshot: dict[str, Any] | None = None,
+    forward_data: dict[str, Any] | None = None,
 ) -> None:
-    if forward_snapshot is None:
-        forward_snapshot = {"rows": [], "trade_date": None, "fetched_at": None, "checked_at": None, "stale": True, "error": "Data CME zatím nebyla načtena."}
+    if forward_data is None:
+        forward_data = {"rows": [], "trade_date": None, "fetched_at": None, "error": "Data CME nebyla při vytváření reportu načtena."}
     event_df = pd.DataFrame([row[:4] for row in EVENTS], columns=["Datum", "Událost", "Kategorie", "Možný kanál"])
     event_df["Datum"] = pd.to_datetime(event_df["Datum"]).dt.strftime("%d.%m.%Y")
 
@@ -1508,8 +1363,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .glossary { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(0, 2fr); column-gap: 18px; row-gap: 8px; margin: 8px 0 0; }
 .glossary dt { font-weight: 650; color: #1f2937; }
 .glossary dd { margin: 0; color: #475569; }
-#forwardStatus { color:#475569; min-height:1.4em; }
-#forwardStatus[data-stale="true"] { color:#9a3412; }
+#forwardError { color:#9a3412; }
 .section-intro { color: #475569; margin-top: 0; }
 @media(max-width: 700px) {
   .wrap { padding: 10px; }
@@ -1710,9 +1564,9 @@ html { scroll-behavior: smooth; scroll-padding-top: var(--header-height, 210px);
   <div class="panel" id="forward-section">
     <h2 class="section-title">4. Forward</h2>
     <p class="section-intro">Henry Hub Natural Gas Futures: vypořádací ceny CME podle měsíce dodání kontraktu. Osa X: Month; osa Y: Settle v USD/MMBtu podle zdroje.</p>
-    <div class="row"><button id="forwardRefreshBtn" type="button">Obnovit data</button><a href="https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html" target="_blank" rel="noopener noreferrer">Zdroj: CME Group</a></div>
-    <p class="small">Datum vypořádání: <strong id="forwardTradeDate">—</strong> · Poslední úspěšné načtení: <span id="forwardFetchedAt">—</span> · Poslední kontrola: <span id="forwardCheckedAt">—</span></p>
-    <p id="forwardStatus" role="status" aria-live="polite"></p>
+    <div class="row"><a href="https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html" target="_blank" rel="noopener noreferrer">Zdroj: CME Group</a></div>
+    <p class="small">Datum vypořádání: <strong id="forwardTradeDate">—</strong> · Data načtena: <span id="forwardFetchedAt">—</span></p>
+    <p id="forwardError" role="alert" hidden></p>
     <div class="chart-panel"><h3 id="forwardChartTitle" class="chart-title">Henry Hub Natural Gas – Forward</h3><div id="forwardChart" style="height:600px"></div></div>
     <p class="small">Settle jsou denní vypořádací ceny futures. Chybějící ceny se vynechají. Křivka ukazuje ceny různých splatností k jednomu datu vypořádání.</p>
   </div>
@@ -1860,37 +1714,21 @@ Plotly.newPlot(chartIds.ote, figures.ote.data, figures.ote.layout, { responsive:
 Plotly.newPlot(chartIds.comparison, figures.comparison.data, figures.comparison.layout, { responsive: true, displaylogo: false }).then(() => { bindLegend('comparison'); updateComparisonChart(); })
 ]);
 
-// Forward uses the CME source unit independently of sections 1–3.
-let forwardData = __FORWARD_SNAPSHOT__;
-let forwardBusy = false;
-let forwardTimer;
-const forwardInterval = __FORWARD_INTERVAL_MS__;
-const forwardStatus = document.getElementById('forwardStatus');
-const forwardButton = document.getElementById('forwardRefreshBtn');
+// Forward is embedded when the report is generated; opening it never downloads data.
+const forwardData = __FORWARD_DATA__;
 function forwardTime(value, dateOnly = false) {
   if (!value) return '—';
   const date = new Date(dateOnly ? value + 'T00:00:00' : value);
   return Number.isNaN(date.getTime()) ? value : dateOnly ? date.toLocaleDateString('cs-CZ') : date.toLocaleString('cs-CZ');
 }
-function forwardCaption() {
-  const data = forwardData;
-  document.getElementById('forwardTradeDate').textContent = forwardTime(data.trade_date, true);
-  document.getElementById('forwardCheckedAt').textContent = forwardTime(data.checked_at);
-  document.getElementById('forwardFetchedAt').textContent = forwardTime(data.fetched_at);
-  const offline = location.protocol === 'file:';
-  forwardStatus.dataset.stale = String(Boolean(data.stale || offline));
-  if (offline) {
-    forwardStatus.textContent = 'Uložený snímek. Pro automatické aktualizace spusťte Python skript a otevřete adresu http://127.0.0.1:… vypsanou v terminálu.';
-  } else if (data.error) {
-    forwardStatus.textContent = (data.rows.length ? 'Zobrazuji poslední úspěšně načtená data. ' : 'Data CME zatím nejsou dostupná. ') + data.error;
-  } else {
-    forwardStatus.textContent = 'Automatická kontrola každých ' + Math.round(forwardInterval / 60000) + ' minut. Nové ceny se zobrazí po publikaci CME.';
-  }
-}
 function renderForward() {
-  forwardCaption();
+  document.getElementById('forwardTradeDate').textContent = forwardTime(forwardData.trade_date, true);
+  document.getElementById('forwardFetchedAt').textContent = forwardTime(forwardData.fetched_at);
+  const errorBox = document.getElementById('forwardError');
+  errorBox.hidden = !forwardData.error;
+  errorBox.textContent = forwardData.error ? 'Data CME se při vytváření reportu nepodařilo načíst. ' + forwardData.error : '';
   const rows = forwardData.rows || [];
-  const note = rows.length ? 'Datum vypořádání: ' + forwardTime(forwardData.trade_date, true) : 'Čekám na data CME';
+  const note = rows.length ? 'Datum vypořádání: ' + forwardTime(forwardData.trade_date, true) : 'Data CME nejsou k dispozici';
   document.getElementById('forwardChartTitle').textContent = 'Henry Hub Natural Gas – Forward · ' + note;
   return Plotly.react('forwardChart', [{
     type: 'scatter', mode: 'lines+markers', name: 'Settle',
@@ -1903,42 +1741,10 @@ function renderForward() {
     xaxis: {title: {text: 'Month – měsíc dodání kontraktu'}, type: 'date', tickformat: '%b %Y', tickangle: -45, tick0: rows[0]?.contract_date, dtick: 'M' + Math.max(1, Math.ceil(rows.length / (window.innerWidth < 700 ? 6 : 18)))},
     yaxis: {title: {text: 'Settle (USD/MMBtu)'}, tickformat: '.3f'},
     uirevision: 'forward', showlegend: false,
-    annotations: rows.length ? [] : [{text: 'Data CME zatím nejsou k dispozici', x: .5, y: .5, xref: 'paper', yref: 'paper', showarrow: false}]
+    annotations: rows.length ? [] : [{text: 'Data CME nejsou k dispozici', x: .5, y: .5, xref: 'paper', yref: 'paper', showarrow: false}]
   }, {responsive: true, displaylogo: false});
 }
-async function refreshForward() {
-  if (forwardBusy || location.protocol === 'file:') return;
-  forwardBusy = true;
-  clearTimeout(forwardTimer);
-  forwardButton.disabled = true;
-  forwardStatus.textContent = 'Kontroluji data CME…';
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 90000);
-  try {
-    const response = await fetch('/api/forward', {cache: 'no-store', signal: controller.signal});
-    if (!response.ok) throw new Error('Server vrátil HTTP ' + response.status + '.');
-    const next = await response.json();
-    if (!Array.isArray(next.rows)) throw new Error('Server vrátil neplatná data.');
-    if (next.rows.length || !forwardData.rows.length) forwardData = next;
-    else forwardData = {...forwardData, stale: true, error: next.error || 'CME nevrátila platné ceny.', checked_at: next.checked_at};
-    await renderForward();
-  } catch (error) {
-    forwardData = {...forwardData, stale: true, error: 'Aktualizace se nezdařila. Ověřte, že Python server běží. ' + (error.name === 'AbortError' ? 'Vypršel časový limit.' : error.message)};
-    forwardCaption();
-  } finally {
-    clearTimeout(timeout);
-    forwardBusy = false;
-    forwardButton.disabled = false;
-    forwardTimer = setTimeout(refreshForward, forwardInterval);
-  }
-}
-forwardButton.addEventListener('click', refreshForward);
-forwardButton.disabled = location.protocol === 'file:';
 const forwardReady = renderForward();
-forwardReady.then(refreshForward);
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshForward();
-});
 
 function addEventShapes(fig, enabled) {
   const shapes = (fig.layout.shapes || []).filter(shape => shape.name !== 'event');
@@ -2382,8 +2188,7 @@ document.getElementById('pdfConfirm').addEventListener('click', async () => {
 </body></html>'''
 
     replacements = {
-        "__FORWARD_SNAPSHOT__": json.dumps(forward_snapshot, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c"),
-        "__FORWARD_INTERVAL_MS__": "300000",
+        "__FORWARD_DATA__": json.dumps(forward_data, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c"),
         "__EXCEL_EXPORTS__": json.dumps(excel_exports),
         "__LOGO__": LOGO_DATA_URI,
         "__PRINT_LOGO__": PRINT_LOGO_DATA_URI,
@@ -2437,9 +2242,6 @@ def main() -> None:
     parser.add_argument("--ote-input", default=INPUT_OTE_DEFAULT, help="Vstupní Excel soubor s cenami OTE")
     parser.add_argument("--fx-input", default=INPUT_FX_DEFAULT, help="Excel s historickými kurzy USD za 1 EUR")
     parser.add_argument("--output", default=OUTPUT_DEFAULT, help="Výstupní HTML soubor")
-    parser.add_argument("--no-serve", action="store_true", help="Pouze vygenerovat HTML se snímkem CME; bez průběžných aktualizací")
-    parser.add_argument("--port", type=int, default=0, help="Port lokálního serveru; 0 vybere volný port")
-    parser.add_argument("--no-browser", action="store_true", help="Neotevírat automaticky prohlížeč")
     args = parser.parse_args([]) if "ipykernel" in sys.modules else parser.parse_args()
 
     hh_prices = read_henry_hub(resolve_input(args.input))
@@ -2465,20 +2267,16 @@ def main() -> None:
                        "comparison": build_comparison_figure(eur_comparison)}}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    forward_store = ForwardStore(output.with_suffix(".forward-cache.json"))
     print("Načítám aktuální forwardovou křivku CME…")
-    forward_snapshot = forward_store.get()
-    if forward_snapshot["error"]:
-        print("Forward: " + forward_snapshot["error"])
-    make_html(hh_figure, ote_figure, comparison_figure, hh_prepared, ote_prepared, comparison, output, eur, forward_snapshot)
+    forward_data = load_forward_for_report()
+    if forward_data["error"]:
+        print("Forward: " + forward_data["error"])
+    make_html(hh_figure, ote_figure, comparison_figure, hh_prepared, ote_prepared, comparison, output, eur, forward_data)
     print(f"Hotovo: {output.resolve()}")
     print(f"Henry Hub: {len(hh_prepared['daily']):,} denních záznamů".replace(",", " "))
     print(f"OTE: {len(ote_prepared['daily']):,} denních záznamů".replace(",", " "))
     print(f"Společné dny pro porovnání: {len(comparison):,}".replace(",", " "))
-    if not args.no_serve:
-        run_report_server(output, forward_store, args.port, open_browser=not args.no_browser and "ipykernel" not in sys.modules)
-    else:
-        print("HTML obsahuje uložený snímek CME. Pro automatické aktualizace spusťte bez --no-serve.")
+
 
 
 if __name__ == "__main__":

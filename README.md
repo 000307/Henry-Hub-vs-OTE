@@ -1,6 +1,6 @@
 # Henry Hub vs OTE + Forward
 
-Skript `henry_hub_ote_forward.py` vytváří interaktivní report s původními sekcemi Henry Hub, OTE a Porovnání a novou sekcí **4. Forward**. Report se zobrazí v prohlížeči po spuštění skriptu s tvými vstupními Excely.
+Skript `henry_hub_ote_forward.py` vytváří interaktivní HTML report se sekcemi Henry Hub, OTE, Porovnání a **4. Forward**. Data CME načte při vytváření reportu a vloží je přímo do HTML. Pro aktualizaci dat stačí vytvořit nový report stejným příkazem.
 
 Pro spuštění ve Windows:
 
@@ -9,10 +9,11 @@ Pro spuštění ve Windows:
 3. Do rozbalené složky vedle skriptu vlož své původní soubory `Spot plynu - HH.xlsx`, `spotové ceny OTE - plyn.xlsx` a `USD to EUR.xlsx`. Tyto Excely nejsou součástí repozitáře.
 4. Otevři tuto složku v Průzkumníku Windows, do horního adresního řádku napiš `cmd` a stiskni Enter. Otevře se příkazový řádek v dané složce.
 5. Zadej `py -m pip install -r requirements.txt` a počkej na dokončení instalace. Tento krok stačí při prvním spuštění.
-6. Zadej `py henry_hub_ote_forward.py`. Report se otevře v prohlížeči. Pokud se neotevře, zkopíruj do prohlížeče celou adresu `http://127.0.0.1:…`, kterou skript vypíše.
+6. Zadej `py henry_hub_ote_forward.py`. Po dokončení se vypíše cesta k vytvořenému reportu a skript skončí.
+7. Dvojklikem otevři soubor `henry_hub_ote_interaktivni_analyza.html` v prohlížeči. Python už nemusí běžet.
 
-**Příkazový řádek s Pythonem nech otevřený.** Při otevřeném reportu se data CME kontrolují každých 5 minut. Ukončení skriptu: Ctrl+C. Samostatné otevření vygenerovaného HTML dvojklikem zobrazí uložený snímek; automatické aktualizace vyžadují běžící Python a vypsanou lokální adresu.
+Graf Forward používá [CME Natural Gas Settlements](https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html): **Month** na ose X a **Settle v USD/MMBtu** na ose Y. Kontrakty jsou seřazené podle měsíců dodání. U grafu je datum vypořádání a čas načtení dat. Settle jsou denní vypořádací ceny; jejich dostupnost závisí na publikaci CME.
 
-Graf Forward používá [CME Natural Gas Settlements](https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html): **Month** na ose X a **Settle v USD/MMBtu** na ose Y. Kontrakty jsou seřazené podle měsíců dodání. Settle jsou denní vypořádací ceny; nová data se objeví po publikaci CME. Při výpadku zůstanou poslední úspěšně načtená data a zobrazí se upozornění.
+Pokud se data CME při vytváření reportu nepodaří načíst, sekce Forward zobrazí chybu. Ostatní sekce reportu lze nadále používat. Po obnovení přístupu k CME spusť skript znovu.
 
-Zpracování odpovědí, cache a aktualizace v prohlížeči byly ověřeny na vzorových datech. Živý přístup k CME zde kvůli omezení sítě nebylo možné ověřit. Podrobnosti a volitelné parametry jsou v `NAVOD.txt`.
+Zpracování odpovědí CME bylo ověřeno na vzorových datech. Živý přístup k CME při přípravě nebylo možné ověřit kvůli omezení sítě. Podrobnosti a volitelné parametry jsou v [NAVOD.txt](NAVOD.txt).
