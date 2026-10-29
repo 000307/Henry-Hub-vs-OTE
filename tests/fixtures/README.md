@@ -1,0 +1,1 @@
+These base64-encoded BIFF8 XLS files are synthetic test workbooks, not downloaded EIA market data. They exercise named sheet and header selection, Excel date cells and serials, comma text values, missing data and misleading Contents-sheet values. Tests decode them in memory; xlwt is not required.

@@ -5,3 +5,4 @@ plotly
 statsmodels
 scipy
 pillow
+xlrd>=2.0.1
