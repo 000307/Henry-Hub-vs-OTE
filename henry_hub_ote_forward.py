@@ -440,41 +440,104 @@ _FED_MONTHS = {name: number for number, name in enumerate(
 
 
 class _FedRateTables(HTMLParser):
-    """Keep table/cell boundaries while allowing nested formatting inside cells."""
+    """Collect tables while honoring implicit cell/row endings in ordinary HTML."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.tables = []
         self._stack = []
+        self._ignored_tag = None
+        self.page_title = ""
+        self._title_parts = []
+        self._in_title = False
+
+    @staticmethod
+    def _finish_cell(table):
+        if table["cell"] is not None:
+            if table["row"] is None:
+                table["row"] = []
+            table["row"].append(" ".join("".join(table["cell"]).split()))
+            table["cell"] = None
+
+    @classmethod
+    def _finish_row(cls, table):
+        cls._finish_cell(table)
+        if table["row"] is not None:
+            table["rows"].append(table["row"])
+            table["row"] = None
+
+    def _finish_table(self):
+        table = self._stack.pop()
+        self._finish_row(table)
+        self.tables.append(table["rows"])
 
     def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if self._ignored_tag is not None:
+            return
+        if tag == "title":
+            self._in_title = True
+            if self._title_parts:
+                self._title_parts.append(" ")
+            return
+        if tag in ("script", "style"):
+            self._ignored_tag = tag
+            return
         if tag == "table":
+            # A nested table gets its own rows; its contents never enter the outer cell.
             self._stack.append({"rows": [], "row": None, "cell": None})
         elif self._stack:
             table = self._stack[-1]
             if tag == "tr":
+                self._finish_row(table)
                 table["row"] = []
             elif tag in ("td", "th"):
+                self._finish_cell(table)
+                if table["row"] is None:
+                    table["row"] = []
                 table["cell"] = []
+            elif tag in ("thead", "tbody", "tfoot"):
+                self._finish_row(table)
             elif tag == "br" and table["cell"] is not None:
                 table["cell"].append(" ")
 
     def handle_data(self, data):
-        if self._stack and self._stack[-1]["cell"] is not None:
+        if self._ignored_tag is None and self._in_title:
+            self._title_parts.append(data)
+        elif self._ignored_tag is None and self._stack and self._stack[-1]["cell"] is not None:
             self._stack[-1]["cell"].append(data)
 
     def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._ignored_tag is not None:
+            if tag == self._ignored_tag:
+                self._ignored_tag = None
+            return
+        if tag == "title":
+            self._in_title = False
+            self.page_title = " ".join("".join(self._title_parts).split())
+            return
         if not self._stack:
             return
         table = self._stack[-1]
-        if tag in ("td", "th") and table["cell"] is not None:
-            if table["row"] is not None:
-                table["row"].append(" ".join("".join(table["cell"]).split()))
-            table["cell"] = None
-        elif tag == "tr" and table["row"] is not None:
-            table["rows"].append(table["row"])
-            table["row"] = None
+        if tag in ("td", "th"):
+            self._finish_cell(table)
+        elif tag in ("tr", "thead", "tbody", "tfoot"):
+            self._finish_row(table)
         elif tag == "table":
-            self.tables.append(self._stack.pop()["rows"])
+            self._finish_table()
+
+    def close(self):
+        super().close()
+        self.page_title = " ".join("".join(self._title_parts).split())
+        # HTML documents may end without explicitly closing their last cell/row/table.
+        while self._stack:
+            self._finish_table()
+
+
+def _fed_header_label(text: str) -> str:
+    """Normalize a header, permitting only a trailing footnote marker."""
+    text = " ".join(text.split()).casefold()
+    return re.sub(r"\s*(?:\[\d+\]|\(\d+\)|[0-9¹²³⁰⁴⁵⁶⁷⁸⁹*†‡]+)\s*$", "", text).strip()
 
 
 def _fed_date(text: str) -> pd.Timestamp:
@@ -517,7 +580,7 @@ def parse_exchange_rates_html(html: str) -> pd.DataFrame:
     for table in parser.tables:
         positions = None
         for row in table:
-            labels = [cell.strip().casefold() for cell in row]
+            labels = [_fed_header_label(cell) for cell in row]
             if "date" in labels and "rate" in labels:
                 positions = (labels.index("date"), labels.index("rate"))
                 found = True
@@ -538,7 +601,10 @@ def parse_exchange_rates_html(html: str) -> pd.DataFrame:
                 raise ValueError("Kurz v tabulce Fed musí být kladné konečné číslo.")
             rows.append((rate_date, value))
     if not found:
-        raise ValueError("V HTML Fed nebyla nalezena tabulka s hlavičkami Date a Rate.")
+        details = f"Počet stažených tabulek: {len(parser.tables)}."
+        if parser.page_title:
+            details += " Název stažené stránky: " + parser.page_title[:120] + "."
+        raise ValueError("Ve stažené odpovědi Fed nebyla rozpoznána tabulka s hlavičkami Date a Rate. " + details)
     return _validated_exchange_rates(pd.DataFrame(rows, columns=["date", "usd_per_eur"]))
 
 
@@ -557,7 +623,7 @@ def read_exchange_rates() -> pd.DataFrame:
     try:
         return parse_exchange_rates_html(html)
     except ValueError as exc:
-        raise RuntimeError("Stažená tabulka kurzů Fed není platná: " + str(exc)) from exc
+        raise RuntimeError("Staženou odpověď Fed se nepodařilo zpracovat: " + str(exc)) from exc
 
 
 def resolve_exchange_rates(dates: pd.Series, rates: pd.DataFrame) -> pd.DataFrame:
