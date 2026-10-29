@@ -1,6 +1,6 @@
 # Python 3.10+; pip install numpy pandas openpyxl plotly statsmodels scipy pillow "xlrd>=2.0.1"
 # Při tvorbě reportu se doplní původní OTE Excel a načtou data EIA, ČNB, Fed a CME.
-# Místní vstup: původní OTE Excel; nové dny se doplní se zálohou souboru. Henry Hub: list Data 1 ze staženého XLS EIA. Logo je vloženo přímo do skriptu.
+# Místní vstupy: původní OTE Excel a Forwardy OTE.xlsx (EUR/MWh). Henry Hub: list Data 1 ze staženého XLS EIA. Logo je vloženo přímo do skriptu.
 from __future__ import annotations
 
 import argparse
@@ -280,8 +280,149 @@ def load_forward_for_report() -> dict[str, Any]:
         }
 
 
+_OTE_FORWARD_MONTHS = {name: number for number, name in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
+_OTE_FORWARD_MISSING = {"", "-", "--", "—", "N/A", "NA", "ND", "NAN", "NONE", "NULL"}
+
+
+def _ote_forward_day(value, epoch=None) -> date:
+    if value is None or isinstance(value, bool):
+        raise ValueError("Chybí datum řádku forwardů OTE.")
+    if isinstance(value, datetime):
+        if pd.isna(value):
+            raise ValueError("Neplatné datum řádku forwardů OTE.")
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, Real):
+        if epoch is not None and math.isfinite(float(value)):
+            converted = from_excel(value, epoch)
+            if isinstance(converted, datetime):
+                return converted.date()
+        raise ValueError("Neplatné číselné datum řádku forwardů OTE.")
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d. %m. %Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError("Neplatné datum řádku forwardů OTE: " + text[:80])
+
+
+def _ote_forward_price(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Cena forwardu OTE nesmí být logická hodnota.")
+    if isinstance(value, Real):
+        result = float(value)
+    else:
+        text = str(value).strip().replace("\u00a0", "").replace(" ", "")
+        if text.upper() in _OTE_FORWARD_MISSING:
+            return None
+        # A comma or period denotes the decimal separator; Excel numeric cells
+        # require no locale conversion. Mixed separators are ambiguous here.
+        if not re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)", text):
+            raise ValueError("Neplatná cena forwardu OTE: " + text[:80])
+        result = float(text.replace(",", "."))
+    if not math.isfinite(result):
+        raise ValueError("Cena forwardu OTE musí být konečné číslo.")
+    return result
+
+
+def _ote_forward_product(value) -> dict:
+    product = " ".join(str(value).replace("\u00a0", " ").strip().split())
+    text = product.upper()
+    month = re.fullmatch(r"([A-Z]{3})\s*-\s*(\d{4})", text)
+    quarter = re.fullmatch(r"Q([1-4])\s*-\s*(\d{4})", text)
+    annual = re.fullmatch(r"CAL\s*-\s*(\d{4})", text)
+    if month and month.group(1) in _OTE_FORWARD_MONTHS:
+        year, month_number = int(month.group(2)), _OTE_FORWARD_MONTHS[month.group(1)]
+        start = date(year, month_number, 1)
+        end = date(year + (month_number == 12), month_number % 12 + 1, 1)
+        kind = "month"
+    elif quarter:
+        year, quarter_number = int(quarter.group(2)), int(quarter.group(1))
+        month_number = 3 * quarter_number - 2
+        start = date(year, month_number, 1)
+        end = date(year + (quarter_number == 4), (month_number + 2) % 12 + 1, 1)
+        kind = "quarter"
+    elif annual:
+        year = int(annual.group(1))
+        start, end, kind = date(year, 1, 1), date(year + 1, 1, 1), "calendar"
+    else:
+        raise ValueError("Neznámý produkt ve forwardech OTE: " + product[:80])
+    return {"product": product, "kind": kind, "delivery_start": start.isoformat(), "delivery_end": end.isoformat()}
+
+
+def read_ote_forward(path: Path, *, today: date | None = None) -> dict:
+    """Choose one nearest calendar date; ties prefer the earlier observation.
+
+    A missing price is skipped, never borrowed from another observation. Period
+    ends are exclusive. The renderer plots monthly prices as separate markers,
+    quarters and calendar years as separate horizontal segments.
+    """
+    path = Path(path)
+    today = _ote_forward_day(today) if today is not None else pd.Timestamp.now(tz="Europe/Prague").date()
+    with path.open("rb") as source:
+        workbook = load_workbook(source, read_only=True, data_only=True)
+        try:
+            sheet = workbook.worksheets[0]
+            records = sheet.iter_rows(values_only=True)
+            header = next(records, None)
+            if not header:
+                raise ValueError("Soubor forwardů OTE je prázdný.")
+            active_columns = [(index, value) for index, value in enumerate(header) if value is not None and str(value).strip()]
+            dates = [index for index, value in active_columns if str(value).strip().casefold() in {"datum", "date"}]
+            if len(dates) != 1:
+                raise ValueError("Forwardy OTE musí obsahovat právě jeden sloupec Datum nebo Date.")
+            date_column = dates[0]
+            products = [(index, _ote_forward_product(value)) for index, value in active_columns if index != date_column]
+            if not products:
+                raise ValueError("Forwardy OTE neobsahují žádné cenové produkty.")
+            keys = [(product["kind"], product["delivery_start"]) for _, product in products]
+            if len(set(keys)) != len(keys):
+                raise ValueError("Forwardy OTE obsahují duplicitní sloupce stejného produktu.")
+            candidates = []
+            for number, row in enumerate(records, start=2):
+                if all(value is None or not str(value).strip() for value in row):
+                    continue
+                try:
+                    observed = _ote_forward_day(row[date_column], workbook.epoch)
+                except (ValueError, OverflowError) as exc:
+                    raise ValueError(f"Forwardy OTE: neplatné datum na řádku {number}.") from exc
+                candidates.append((observed, number, row))
+            if not candidates:
+                raise ValueError("Forwardy OTE neobsahují žádné datované řádky.")
+            closest = min((observed for observed, _, _ in candidates), key=lambda day: (abs((day - today).days), day))
+            selected = []
+            for observed, number, row in candidates:
+                if observed != closest:
+                    continue
+                try:
+                    prices = tuple(_ote_forward_price(row[index] if index < len(row) else None) for index, _ in products)
+                except ValueError as exc:
+                    raise ValueError(f"Forwardy OTE: vadná cena na vybraném řádku {number}. {exc}") from exc
+                selected.append(prices)
+            if any(prices != selected[0] for prices in selected[1:]):
+                raise ValueError(f"Forwardy OTE obsahují rozdílné ceny pro vybrané datum {closest.isoformat()}.")
+            rows, skipped = [], []
+            for (_, product), price in zip(products, selected[0]):
+                if price is None:
+                    skipped.append(product["product"])
+                else:
+                    rows.append({**product, "price": price})
+            return {"rows": rows, "quote_date": closest.isoformat(),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "source_file": path.name, "skipped_products": skipped,
+                    "source_currency": "EUR", "source_unit": "mwh"}
+        finally:
+            workbook.close()
+
+
 # Vstupní a výstupní soubory
 INPUT_OTE_DEFAULT = "spotové ceny OTE - plyn.xlsx"
+INPUT_OTE_FORWARD_DEFAULT = "Forwardy OTE.xlsx"
 LOGO_DATA_URI = "data:image/webp;base64,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"
 PRINT_LOGO_DATA_URI = "data:image/png;base64,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"
 OUTPUT_DEFAULT = "henry_hub_ote_interaktivni_analyza.html"
@@ -2326,9 +2467,12 @@ def make_html(
     output: Path,
     eur: dict[str, Any],
     forward_data: dict[str, Any] | None = None,
+    ote_forward_data: dict[str, Any] | None = None,
 ) -> None:
     if forward_data is None:
         forward_data = {"rows": [], "trade_date": None, "fetched_at": None, "error": "Data CME nebyla při vytváření reportu načtena."}
+    if ote_forward_data is None:
+        ote_forward_data = {"rows": [], "quote_date": None, "source_file": "Forwardy OTE.xlsx", "error": "Soubor Forwardy OTE.xlsx nebyl při vytváření reportu načten."}
     event_df = pd.DataFrame([row[:4] for row in EVENTS], columns=["Datum", "Událost", "Kategorie", "Možný kanál"])
     event_df["Datum"] = pd.to_datetime(event_df["Datum"]).dt.strftime("%d.%m.%Y")
 
@@ -2603,13 +2747,17 @@ html { scroll-behavior: smooth; scroll-padding-top: var(--header-height, 210px);
 
   <div class="panel" id="forward-section">
     <h2 class="section-title">4. Forward</h2>
-    <p class="section-intro">Henry Hub Natural Gas Futures: vypořádací ceny CME podle měsíce dodání kontraktu. Osa X: Month; osa Y: Settle ve zvolené měně a jednotce. Výchozí data CME jsou v USD/MMBtu.</p>
+    <p class="section-intro">Henry Hub: vypořádací ceny CME podle měsíce dodání kontraktu (výchozí USD/MMBtu). OTE: ceny z jediného řádku Excelu s datem nejbližším dni vytvoření reportu (výchozí EUR/MWh). Měsíce jsou samostatné body, kvartály vodorovné úsečky přes tři měsíce a Cal přes celý rok.</p>
     <div class="row"><a href="https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html" target="_blank" rel="noopener noreferrer">Zdroj: CME Group</a></div>
     <p class="small">Datum vypořádání: <strong id="forwardTradeDate">—</strong> · Data načtena: <span id="forwardFetchedAt">—</span></p>
     <p class="small" id="forwardFxInfo" hidden></p>
     <p id="forwardError" role="alert" hidden></p>
-    <div class="chart-panel"><h3 id="forwardChartTitle" class="chart-title">Henry Hub Natural Gas – Forward</h3><div id="forwardChart" style="height:600px"></div></div>
-    <p class="small">Settle jsou denní vypořádací ceny futures. Chybějící ceny se vynechají. Křivka ukazuje ceny různých splatností k jednomu datu vypořádání.</p>
+    <p class="small">OTE · vybraný den: <strong id="oteForwardQuoteDate">—</strong> · Soubor: <span id="oteForwardSource">—</span></p>
+    <p class="small" id="oteForwardFxInfo" hidden></p>
+    <p class="small" id="oteForwardMissing" hidden></p>
+    <p id="oteForwardError" role="alert" hidden></p>
+    <div class="chart-panel"><h3 id="forwardChartTitle" class="chart-title">Henry Hub a OTE – Forward</h3><div id="forwardChart" style="height:600px"></div></div>
+    <p class="small">Osa X zobrazuje období dodávky, osa Y cenu ve zvolené měně a jednotce. Body OTE leží na začátku příslušného měsíce. Každá úsečka představuje jednu cenu pro celé období; jednotlivé produkty OTE se navzájem nespojují. Chybějící ceny se vynechají.</p>
   </div>
 
   <div class="panel" id="events-section">
@@ -2758,44 +2906,97 @@ Plotly.newPlot(chartIds.comparison, figures.comparison.data, figures.comparison.
 
 // Forward is embedded when the report is generated; opening it never downloads data.
 const forwardData = __FORWARD_DATA__;
+const oteForwardData = __OTE_FORWARD_DATA__;
 function forwardTime(value, dateOnly = false) {
   if (!value) return '—';
   const date = new Date(dateOnly ? value + 'T00:00:00' : value);
   return Number.isNaN(date.getTime()) ? value : dateOnly ? date.toLocaleDateString('cs-CZ') : date.toLocaleString('cs-CZ');
 }
+function forwardRateDescription(data) {
+  const rateDate = forwardTime(data.fx_rate_date, true);
+  if (data.fx_rate_method === 'neighbor_mean') return 'průměr kurzů z ' + rateDate + ' a ' + forwardTime(data.fx_next_rate_date, true);
+  if (data.fx_rate_method === 'last_available') return 'poslední dostupný kurz z ' + rateDate;
+  return 'kurz z ' + rateDate;
+}
 function renderForward() {
   document.getElementById('forwardTradeDate').textContent = forwardTime(forwardData.trade_date, true);
   document.getElementById('forwardFetchedAt').textContent = forwardTime(forwardData.fetched_at);
+  document.getElementById('oteForwardQuoteDate').textContent = forwardTime(oteForwardData.quote_date, true);
+  document.getElementById('oteForwardSource').textContent = oteForwardData.source_file || 'Forwardy OTE.xlsx';
   const label = unitLabels[globalState.unit];
   const isEur = globalState.currency === 'EUR';
   const fxRate = forwardData.fx_rate;
+  const oteFxRate = oteForwardData.fx_rate;
   const missingFx = isEur && forwardData.rows.length > 0 && (!Number.isFinite(fxRate) || fxRate <= 0);
+  const missingOteFx = !isEur && oteForwardData.rows.length > 0 && (!Number.isFinite(oteFxRate) || oteFxRate <= 0);
   const errorBox = document.getElementById('forwardError');
   errorBox.hidden = !forwardData.error && !missingFx;
-  errorBox.textContent = forwardData.error ? 'Data CME se při vytváření reportu nepodařilo načíst. ' + forwardData.error : missingFx ? 'Pro převod Forwardu do EUR chybí platný kurz k datu vypořádání.' : '';
+  errorBox.textContent = forwardData.error ? 'Data CME se při vytváření reportu nepodařilo načíst. ' + forwardData.error : missingFx ? 'Pro převod Forwardu CME do EUR chybí platný kurz k datu vypořádání.' : '';
+  const oteErrorBox = document.getElementById('oteForwardError');
+  oteErrorBox.hidden = !oteForwardData.error && !missingOteFx;
+  oteErrorBox.textContent = oteForwardData.error || (missingOteFx ? 'Pro převod forwardů OTE do USD chybí platný kurz k vybranému datu.' : '');
   const fxInfo = document.getElementById('forwardFxInfo');
   fxInfo.hidden = !isEur || !forwardData.rows.length || missingFx;
-  const rateDate = forwardTime(forwardData.fx_rate_date, true);
-  let rateDescription = 'kurz z ' + rateDate;
-  if (forwardData.fx_rate_method === 'neighbor_mean') rateDescription = 'průměr kurzů z ' + rateDate + ' a ' + forwardTime(forwardData.fx_next_rate_date, true);
-  if (forwardData.fx_rate_method === 'last_available') rateDescription = 'poslední dostupný kurz z ' + rateDate;
-  fxInfo.textContent = isEur && !missingFx && forwardData.rows.length ? 'Převod celé křivky podle data vypořádání CME: 1 EUR = ' + fxRate.toLocaleString('cs-CZ', {maximumFractionDigits: 6}) + ' USD (' + rateDescription + ', Federal Reserve).' : '';
+  fxInfo.textContent = !fxInfo.hidden ? 'CME · převod podle data vypořádání: 1 EUR = ' + fxRate.toLocaleString('cs-CZ', {maximumFractionDigits: 6}) + ' USD (' + forwardRateDescription(forwardData) + ', Federal Reserve).' : '';
+  const oteFxInfo = document.getElementById('oteForwardFxInfo');
+  oteFxInfo.hidden = isEur || !oteForwardData.rows.length || missingOteFx;
+  oteFxInfo.textContent = !oteFxInfo.hidden ? 'OTE · převod podle vybraného dne: 1 EUR = ' + oteFxRate.toLocaleString('cs-CZ', {maximumFractionDigits: 6}) + ' USD (' + forwardRateDescription(oteForwardData) + ', Federal Reserve).' : '';
+  const skipped = oteForwardData.skipped_products || [];
+  document.getElementById('oteForwardMissing').hidden = !skipped.length;
+  document.getElementById('oteForwardMissing').textContent = skipped.length ? 'Ve vybraném řádku chybí ceny: ' + skipped.join(', ') + '. Ceny z jiných dnů se nedoplňují.' : '';
   const rows = missingFx ? [] : (forwardData.rows || []);
+  const oteRows = missingOteFx ? [] : (oteForwardData.rows || []);
   const factor = (globalState.unit === 'mwh' ? __MMBTU_PER_MWH__ : 1) / (isEur ? fxRate : 1);
-  const note = rows.length ? 'Datum vypořádání: ' + forwardTime(forwardData.trade_date, true) : 'Data nejsou k dispozici';
-  document.getElementById('forwardChartTitle').textContent = 'Henry Hub Natural Gas – Forward (' + label + ') · ' + note;
-  return Plotly.react('forwardChart', [{
-    type: 'scatter', mode: 'lines+markers', name: 'Settle',
-    x: rows.map(row => row.contract_date), y: rows.map(row => row.settle * factor),
-    customdata: rows.map(row => row.month),
-    line: {color: '#832C29', width: 2}, marker: {size: 5},
-    hovertemplate: 'Month: %{customdata}<br>Settle: %{y:.3f} ' + label + '<extra></extra>'
-  }], {
-    template: 'plotly_white', margin: {l: 70, r: 30, t: 35, b: 85},
-    xaxis: {title: {text: 'Month – měsíc dodání kontraktu'}, type: 'date', tickformat: '%b %Y', tickangle: -45, tick0: rows[0]?.contract_date, dtick: 'M' + Math.max(1, Math.ceil(rows.length / (window.innerWidth < 700 ? 6 : 18)))},
-    yaxis: {title: {text: 'Settle (' + label + ')'}, tickformat: '.3f'},
-    uirevision: 'forward:' + globalState.currency + ':' + globalState.unit, showlegend: false,
-    annotations: rows.length ? [] : [{text: 'Data nejsou k dispozici', x: .5, y: .5, xref: 'paper', yref: 'paper', showarrow: false}]
+  const oteFactor = (isEur ? 1 : oteFxRate) / (globalState.unit === 'mwh' ? 1 : __MMBTU_PER_MWH__);
+  const dates = [];
+  const traces = [];
+  if (rows.length) {
+    traces.push({
+      type: 'scatter', mode: 'lines+markers', name: 'Henry Hub · CME', meta: {source: 'cme'},
+      x: rows.map(row => row.contract_date), y: rows.map(row => row.settle * factor),
+      customdata: rows.map(row => row.month),
+      line: {color: '#832C29', width: 2}, marker: {size: 5},
+      hovertemplate: 'CME · %{customdata}<br>Settle: %{y:.3f} ' + label + '<extra></extra>'
+    });
+    dates.push(...rows.map(row => row.contract_date));
+  }
+  const months = oteRows.filter(row => row.kind === 'month');
+  if (months.length) traces.push({
+    type: 'scatter', mode: 'markers', name: 'OTE · měsíce', meta: {source: 'ote', kind: 'month'},
+    x: months.map(row => row.delivery_start), y: months.map(row => row.price * oteFactor),
+    customdata: months.map(row => row.product), marker: {color: '#1565c0', size: 10},
+    hovertemplate: 'OTE · %{customdata}<br>Cena: %{y:.3f} ' + label + '<extra></extra>'
+  });
+  for (const [kind, name, color] of [['quarter', 'OTE · kvartály', '#00897b'], ['calendar', 'OTE · roky (Cal)', '#6d4c9c']]) {
+    oteRows.filter(row => row.kind === kind).forEach((row, index) => {
+      const endDay = new Date(row.delivery_end + 'T12:00:00');
+      endDay.setDate(endDay.getDate() - 1);
+      const period = forwardTime(row.delivery_start, true) + ' – ' + endDay.toLocaleDateString('cs-CZ');
+      traces.push({
+        type: 'scatter', mode: 'lines', name, meta: {source: 'ote', kind, product: row.product},
+        legendgroup: 'ote-' + kind, showlegend: index === 0,
+        x: [row.delivery_start, row.delivery_end], y: [row.price * oteFactor, row.price * oteFactor],
+        customdata: [[row.product, period], [row.product, period]], line: {color, width: 4},
+        hovertemplate: 'OTE · %{customdata[0]}<br>%{customdata[1]}<br>Cena: %{y:.3f} ' + label + '<extra></extra>'
+      });
+    });
+  }
+  for (const row of oteRows) dates.push(row.delivery_start, row.kind === 'month' ? row.delivery_start : row.delivery_end);
+  dates.sort();
+  const first = dates.length ? new Date(dates[0]) : null;
+  const last = dates.length ? new Date(dates[dates.length - 1]) : null;
+  const spanMonths = first && last ? (last.getUTCFullYear() - first.getUTCFullYear()) * 12 + last.getUTCMonth() - first.getUTCMonth() + 1 : 1;
+  const notes = [];
+  if (rows.length) notes.push('CME: ' + forwardTime(forwardData.trade_date, true));
+  if (oteRows.length) notes.push('OTE: ' + forwardTime(oteForwardData.quote_date, true));
+  document.getElementById('forwardChartTitle').textContent = 'Henry Hub a OTE – Forward (' + label + ') · ' + (notes.join(' · ') || 'Data nejsou k dispozici');
+  return Plotly.react('forwardChart', traces, {
+    template: 'plotly_white', margin: {l: 70, r: 30, t: 55, b: 85},
+    xaxis: {title: {text: 'Období dodávky'}, type: 'date', tickformat: '%b %Y', tickangle: -45, tick0: dates[0], dtick: 'M' + Math.max(1, Math.ceil(spanMonths / (window.innerWidth < 700 ? 6 : 18)))},
+    yaxis: {title: {text: 'Cena (' + label + ')'}, tickformat: '.3f'},
+    uirevision: 'forward:' + globalState.currency + ':' + globalState.unit,
+    showlegend: true, legend: {orientation: 'h', x: 0, y: 1.12, groupclick: 'togglegroup'},
+    annotations: traces.length ? [] : [{text: 'Data nejsou k dispozici', x: .5, y: .5, xref: 'paper', yref: 'paper', showarrow: false}]
   }, {responsive: true, displaylogo: false});
 }
 let forwardReady = renderForward();
@@ -3006,7 +3207,7 @@ function preparePdfChoices() {
     });
     group(title, items);
   }
-  if (forwardData.rows.length) group('Forward · ' + unitLabels[globalState.unit], [{type:'chart', id:'forwardChart', title:document.getElementById('forwardChartTitle').textContent}]);
+  if (forwardData.rows.length || oteForwardData.rows.length) group('Forward · ' + unitLabels[globalState.unit], [{type:'chart', id:'forwardChart', title:document.getElementById('forwardChartTitle').textContent}]);
   group('Další části', [
     {type:'section', node:document.getElementById('events-section'), title:'Události s potenciálním vlivem na cenu'},
     {type:'section', node:document.getElementById('glossary-section'), title:'Slovníček statistických pojmů a metod'}
@@ -3246,6 +3447,7 @@ document.getElementById('pdfConfirm').addEventListener('click', async () => {
     replacements = {
         "__MMBTU_PER_MWH__": json.dumps(MMBTU_PER_MWH),
         "__FORWARD_DATA__": json.dumps(forward_data, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c"),
+        "__OTE_FORWARD_DATA__": json.dumps(ote_forward_data, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c"),
         "__EXCEL_EXPORTS__": json.dumps(excel_exports),
         "__LOGO__": LOGO_DATA_URI,
         "__PRINT_LOGO__": PRINT_LOGO_DATA_URI,
@@ -3290,13 +3492,38 @@ def resolve_input(name: str) -> Path:
     raise FileNotFoundError(
         f"Vstupní soubor nebyl nalezen: {name}. Hledané složky: {searched}. "
         "V Jupyteru/Colabu nahrajte Excel do pracovního adresáře "
-        "nebo nastavte INPUT_OTE_DEFAULT na jeho cestu."
+        "nebo nastavte příslušnou konstantu INPUT_OTE_DEFAULT / INPUT_OTE_FORWARD_DEFAULT na jeho cestu."
+    )
+
+
+def load_ote_forward_for_report(name: str = INPUT_OTE_FORWARD_DEFAULT) -> dict[str, Any]:
+    """Read the local quotation file once; retain the other report sections on failure."""
+    try:
+        data = read_ote_forward(resolve_input(name))
+        return {**data, "error": None}
+    except Exception as exc:
+        return {"rows": [], "quote_date": None, "fetched_at": None,
+                "source_file": Path(name).name, "source_currency": "EUR", "source_unit": "mwh",
+                "skipped_products": [], "error": "Forwardy OTE se nepodařilo načíst. " + str(exc)}
+
+
+def attach_forward_exchange_rate(data: dict[str, Any], rates: pd.DataFrame, date_field: str) -> None:
+    """Each source uses its own quotation day, never a delivery period's day."""
+    if not data["rows"]:
+        return
+    resolved = resolve_exchange_rates(pd.Series([pd.Timestamp(data[date_field])]), rates).iloc[0]
+    data.update(
+        fx_rate=float(resolved["usd_per_eur"]),
+        fx_rate_date=resolved["rate_date"].strftime("%Y-%m-%d"),
+        fx_next_rate_date=resolved["next_rate_date"].strftime("%Y-%m-%d") if pd.notna(resolved["next_rate_date"]) else None,
+        fx_rate_method=resolved["rate_method"],
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interaktivní analýza spotových cen zemního plynu Henry Hub a OTE")
     parser.add_argument("--ote-input", default=INPUT_OTE_DEFAULT, help="Vstupní Excel soubor s cenami OTE")
+    parser.add_argument("--ote-forward-input", default=INPUT_OTE_FORWARD_DEFAULT, help="Excel s forwardy OTE v EUR/MWh")
     parser.add_argument("--output", default=OUTPUT_DEFAULT, help="Výstupní HTML soubor")
     args = parser.parse_args([]) if "ipykernel" in sys.modules else parser.parse_args()
 
@@ -3338,17 +3565,17 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     print("Načítám aktuální forwardovou křivku CME…")
     forward_data = load_forward_for_report()
-    if forward_data["rows"]:
-        forward_fx = resolve_exchange_rates(pd.Series([pd.Timestamp(forward_data["trade_date"])]), rates).iloc[0]
-        forward_data.update(
-            fx_rate=float(forward_fx["usd_per_eur"]),
-            fx_rate_date=forward_fx["rate_date"].strftime("%Y-%m-%d"),
-            fx_next_rate_date=forward_fx["next_rate_date"].strftime("%Y-%m-%d") if pd.notna(forward_fx["next_rate_date"]) else None,
-            fx_rate_method=forward_fx["rate_method"],
-        )
+    attach_forward_exchange_rate(forward_data, rates, "trade_date")
     if forward_data["error"]:
         print("Forward: " + forward_data["error"])
-    make_html(hh_figure, ote_figure, comparison_figure, hh_prepared, ote_prepared, comparison, output, eur, forward_data)
+    print("Načítám forwardy OTE z Excelu (EUR/MWh)…")
+    ote_forward_data = load_ote_forward_for_report(args.ote_forward_input)
+    attach_forward_exchange_rate(ote_forward_data, rates, "quote_date")
+    if ote_forward_data["error"]:
+        print(ote_forward_data["error"])
+    else:
+        print(f"Forward OTE: vybrán {pd.Timestamp(ote_forward_data['quote_date']):%d.%m.%Y}, {len(ote_forward_data['rows'])} cen.")
+    make_html(hh_figure, ote_figure, comparison_figure, hh_prepared, ote_prepared, comparison, output, eur, forward_data, ote_forward_data)
     print(f"Hotovo: {output.resolve()}")
     print(f"Henry Hub: {len(hh_prepared['daily']):,} denních záznamů".replace(",", " "))
     print(f"OTE: {len(ote_prepared['daily']):,} denních záznamů".replace(",", " "))

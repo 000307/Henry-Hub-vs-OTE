@@ -6,7 +6,8 @@ Pro spuštění ve Windows:
 
 1. Nainstaluj [Python](https://www.python.org/downloads/) ve verzi 3.10 nebo novější, pokud jej ještě nemáš.
 2. Na stránce tohoto repozitáře klikni na zelené **Code → Download ZIP**. Stažený ZIP rozbal.
-3. Do rozbalené složky vedle skriptu vlož svůj původní soubor `spotové ceny OTE - plyn.xlsx`. Je to jediný potřebný místní Excel a není součástí repozitáře. Musí obsahovat sloupec `Date` a alespoň jeden původní cenový sloupec OTE v USD/MWh nebo USD/MMBtu.
+3. Do rozbalené složky vedle skriptu vlož svůj původní soubor `spotové ceny OTE - plyn.xlsx`. Soubor není součástí repozitáře. Musí obsahovat sloupec `Date` a alespoň jeden původní cenový sloupec OTE v USD/MWh nebo USD/MMBtu.
+   Pro přidání forwardových cen OTE do sekce 4 vlož vedle skriptu také `Forwardy OTE.xlsx`. Tento soubor se pouze čte a tvoje přiložená data se do veřejného repozitáře nenahrávají.
 4. Otevři tuto složku v Průzkumníku Windows, do horního adresního řádku napiš `cmd` a stiskni Enter. Otevře se příkazový řádek v dané složce.
 5. Zadej `py -m pip install -r requirements.txt` a počkej na dokončení instalace. **Po stažení této nové verze instalaci zopakuj i v případě, že už jsi knihovny instaloval.** Knihovna `xlrd>=2.0.1` slouží k načtení formátu EIA `.xls`.
 6. S připojením k internetu zadej `py henry_hub_ote_forward.py`. Po dokončení se vypíše cesta k vytvořenému reportu a skript skončí.
@@ -24,10 +25,14 @@ Společné přepínače **USD/EUR** a **MMBtu/MWh** platí pro všechny čtyři 
 
 Původní publikované číselné kurzy se zachovají. Chybějící dny, včetně `ND` a víkendů, dostanou aritmetický průměr nejbližšího předchozího a následujícího původního kurzu. Celá mezera mezi nimi používá stejnou hodnotu. Pro cenová data před 3. 1. 2000 se použije kurz ze 3. 1. 2000; po posledním publikovaném kurzu poslední dostupný kurz.
 
-Graf Forward používá [CME Natural Gas Settlements](https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html): **Month** na ose X a **Settle** na ose Y ve zvolené měně a jednotce. Kontrakty jsou seřazené podle měsíců dodání. Celá křivka v EUR používá kurz k datu vypořádání CME; u grafu je uvedeno datum použitého kurzu. Settle jsou denní vypořádací ceny a jejich dostupnost závisí na publikaci CME.
+Sekce **4. Forward** porovnává v jednom grafu [CME Natural Gas Settlements](https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html) a forwardové ceny OTE z prvního listu `Forwardy OTE.xlsx`. CME používá **Month** na ose X a **Settle** na ose Y. U OTE skript vybere jediný řádek, jehož `Datum` je nejblíže dnešku v Praze; při stejné vzdálenosti přednostně vybere minulý den. Všechny OTE produkty použije z tohoto řádku, chybějící ceny nedoplňuje z jiného dne.
+
+Měsíční OTE produkty se zobrazí jako body, kvartály jako vodorovné úseky přes tři měsíce a produkty `Cal` přes celý rok. Základní jednotka OTE je **EUR/MWh**; obě řady reagují na společné přepínače měny a jednotky. Převod OTE do USD používá kurz Fed k datu vybraného řádku (`USD = EUR × Rate`), zatímco převod CME do EUR používá datum vypořádání CME.
+
+Pokud `Forwardy OTE.xlsx` chybí, report se přesto vytvoří a sekce 4 oznámí chybějící soubor. Jinou cestu lze zadat přes `--ote-forward-input`. Settle CME jsou denní vypořádací ceny a jejich dostupnost závisí na publikaci CME.
 
 Pokud se data CME při vytváření reportu nepodaří načíst, sekce Forward zobrazí chybu. Ostatní sekce reportu lze nadále používat. Po obnovení přístupu k CME spusť skript znovu.
 
 Kvůli omezení sítě nebylo v tomto cloudovém prostředí možné živě ověřit stažení souborů EIA a OTE ani přímé stahování z Fed a CME. Cílový odkaz EIA, primární tabulka Fed a textový formát kurzů ČNB byly ověřeny přes webový nástroj. Podrobnosti a volitelné parametry jsou v [NAVOD.txt](NAVOD.txt).
 
-Ověřovací testy načítání cvičných `.xls`, ZIP a `.xlsx` souborů, doplnění OTE a převodů kurzů lze spustit příkazem `py -m unittest discover -s tests -v`.
+Ověřovací testy načítání cvičných `.xls`, ZIP a `.xlsx` souborů, doplnění spotových cen OTE, čtení forwardových produktů a převodů kurzů lze spustit příkazem `py -m unittest discover -s tests -v`.
