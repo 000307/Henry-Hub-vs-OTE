@@ -1,6 +1,6 @@
 # Python 3.10+; pip install numpy pandas openpyxl plotly statsmodels scipy pillow "xlrd>=2.0.1"
-# Data Henry Hub (EIA), kurzy Fed a forward CME se načítají jednou při vytvoření HTML reportu.
-# Místní vstup: první list Excelu OTE. Henry Hub: list Data 1 ze staženého XLS EIA. Logo je vloženo přímo do skriptu.
+# Při tvorbě reportu se doplní původní OTE Excel a načtou data EIA, ČNB, Fed a CME.
+# Místní vstup: původní OTE Excel; nové dny se doplní se zálohou souboru. Henry Hub: list Data 1 ze staženého XLS EIA. Logo je vloženo přímo do skriptu.
 from __future__ import annotations
 
 import argparse
@@ -29,6 +29,23 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import unicodedata
+from datetime import date, datetime
+from pathlib import PurePosixPath
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
+from zipfile import BadZipFile, ZipFile
+from copy import copy
+from datetime import date, datetime, timedelta
+import os
+import posixpath
+import shutil
+import tempfile
+import xml.etree.ElementTree as ET
+from zipfile import ZipFile
+from openpyxl import load_workbook
+from openpyxl.utils.datetime import from_excel
+from openpyxl.styles.numbers import is_date_format
 
 CME_FORWARD_SOURCE = "https://www.cmegroup.com/markets/energy/natural-gas/natural-gas.settlements.html"
 # Endpoint used by the CME web table; CME may change this public web interface.
@@ -470,6 +487,741 @@ def read_henry_hub() -> pd.DataFrame:
         return parse_henry_hub_xls(content)
     except ValueError as exc:
         raise RuntimeError("Stažená data Henry Hub z EIA nejsou platná: " + str(exc)) from exc
+
+
+OTE_ANNUAL_SOURCE_TEMPLATE = "https://www.ote-cr.cz/cs/statistika/rocni-zprava?date={year}-01-01"
+_OTE_PRICE_HEADERS = (
+    "Použitelná cena pro záporné vyrovnávací množství (Kč/MWh)",
+    "Použitelná cena pro záporné denní vyrovnávací množství (Kč/MWh)",
+)
+
+
+def _ote_normalize(value) -> str:
+    text = unicodedata.normalize("NFKD", " ".join(str(value).split()).casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return re.sub(r"\s*([()/])\s*", r"\1", text)
+
+
+class _OteAnnualLinks(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links, self.headings, self.title = [], [], []
+        self._anchor = None
+        self._heading = self._in_title = False
+        self._ignored = None
+
+    def _finish_anchor(self):
+        if self._anchor is not None:
+            self.links.append(self._anchor)
+            self._anchor = None
+
+    def handle_starttag(self, tag, attrs):
+        if self._ignored:
+            return
+        if tag in ("script", "style"):
+            self._ignored = tag
+        elif tag == "a":
+            self._finish_anchor()
+            attrs = dict(attrs)
+            self._anchor = [attrs.get("href", ""), attrs.get("title", ""), []]
+        elif tag in ("h1", "h2", "h3"):
+            self._heading = True
+        elif tag == "title":
+            self._in_title = True
+
+    def handle_data(self, data):
+        if self._ignored:
+            return
+        if self._anchor is not None:
+            self._anchor[2].append(data)
+        if self._heading:
+            self.headings.append(data)
+        if self._in_title:
+            self.title.append(data)
+
+    def handle_endtag(self, tag):
+        if self._ignored:
+            if tag == self._ignored:
+                self._ignored = None
+            return
+        if tag == "a":
+            self._finish_anchor()
+        elif tag in ("h1", "h2", "h3"):
+            self._heading = False
+        elif tag == "title":
+            self._in_title = False
+
+    def close(self):
+        super().close()
+        self._finish_anchor()
+
+
+def _ote_version(text: str) -> int:
+    values = re.findall(r"(?:^|[^a-z0-9])v(\d+)(?=$|[^a-z0-9])", text.casefold())
+    return max(map(int, values)) if values else -1
+
+
+def _ote_pick(candidates: dict[str, int], year: int, kind: str) -> str | None:
+    if not candidates:
+        return None
+    # OTE updates V0 daily; V1/V2 have a reporting lag and may omit recent days.
+    preferred = 0 if 0 in candidates.values() else max(candidates.values())
+    if preferred != 0 and year >= pd.Timestamp.now(tz="Europe/Prague").year:
+        raise ValueError(f"OTE pro aktuální rok {year} nenabízí průběžnou verzi V0 ({kind}).")
+    selected = [name for name, version in candidates.items() if version == preferred]
+    if len(selected) != 1:
+        raise ValueError(f"OTE obsahuje více nejednoznačných souborů stejné preferované verze ({kind}).")
+    return selected[0]
+
+
+def _ote_url(url: str) -> str:
+    parts = urlsplit(url)
+    if (parts.scheme.casefold() != "https" or parts.hostname not in ("www.ote-cr.cz", "ote-cr.cz")
+            or parts.username or parts.password or parts.port not in (None, 443)):
+        raise ValueError("Odkaz roční zprávy musí směřovat přes HTTPS přímo na ote-cr.cz.")
+    return urlunsplit(("https", parts.netloc, quote(parts.path, safe="/%:@!$&'()*+,;=-._~"),
+                       quote(parts.query, safe="%=&?/:;+,$@!()*'-._~"), ""))
+
+
+def find_ote_gas_zip_url(html: str, year: int, page_url: str) -> str | None:
+    parser = _OteAnnualLinks()
+    parser.feed(html)
+    parser.close()
+    candidates = {}
+    for href, title, label in parser.links:
+        combined = _ote_normalize(unquote(href) + " " + title + " " + " ".join(label))
+        if (not urlsplit(href).path.casefold().endswith(".zip") or "plyn" not in combined
+                or "elektr" in combined or not re.search(rf"(?<!\d){year}(?!\d)", combined)):
+            continue
+        url = _ote_url(urljoin(page_url, href))
+        candidates[url] = max(candidates.get(url, -1), _ote_version(combined))
+    return _ote_pick(candidates, year, "ZIP")
+
+
+def _ote_check_zip(archive: ZipFile):
+    members = archive.infolist()
+    if len({item.filename for item in members}) != len(members):
+        raise ValueError("Archiv OTE obsahuje duplicitní názvy souborů.")
+    if len(members) > 200 or sum(item.file_size for item in members) > 100_000_000:
+        raise ValueError("Archiv OTE překračuje limit počtu souborů nebo rozbalené velikosti 100 MB.")
+    if any(item.file_size > 30_000_000 or item.flag_bits & 1 for item in members):
+        raise ValueError("Archiv OTE obsahuje příliš velký nebo šifrovaný soubor.")
+    return members
+
+
+def _ote_date(value):
+    if pd.isna(value) or isinstance(value, bool):
+        return pd.NaT
+    try:
+        if isinstance(value, (date, datetime, pd.Timestamp)):
+            return pd.Timestamp(value).normalize()
+        if isinstance(value, Real):
+            parsed = pd.to_datetime(float(value), unit="D", origin="1899-12-30", errors="coerce")
+            return pd.NaT if pd.isna(parsed) else parsed.normalize()
+        text = str(value).strip()
+        for fmt in ("%d.%m.%Y", "%d. %m. %Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return pd.Timestamp(datetime.strptime(text, fmt)).normalize()
+            except ValueError:
+                pass
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return pd.NaT
+
+
+def _ote_price(value) -> float:
+    if isinstance(value, bool):
+        return math.nan
+    if isinstance(value, Real):
+        return float(value)
+    text = "".join(str(value).split())
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    else:
+        text = text.replace(",", ".")
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
+        return math.nan
+    return float(text)
+
+
+def _ote_header(raw: pd.DataFrame) -> tuple[int, int, int]:
+    wanted_date = _ote_normalize("Plynárenský den")
+    wanted_prices = {_ote_normalize(value) for value in _OTE_PRICE_HEADERS}
+    for end in range(min(len(raw), 50)):
+        for height in range(1, min(3, end + 1) + 1):
+            block = raw.iloc[end - height + 1:end + 1]
+            labels = [_ote_normalize(" ".join(str(value) for value in column if pd.notna(value)))
+                      for _, column in block.items()]
+            dates = [pos for pos, label in enumerate(labels) if label == wanted_date]
+            prices = [pos for pos, label in enumerate(labels) if label in wanted_prices]
+            if dates and prices:
+                if len(dates) != 1 or len(prices) != 1:
+                    raise ValueError("List OTE obsahuje nejednoznačné sloupce dne nebo záporné ceny.")
+                return end + 1, dates[0], prices[0]
+    raise ValueError("V listu 'Odchylky NC BAL' chybí Plynárenský den nebo přesný sloupec ceny pro záporné vyrovnávací množství (Kč/MWh).")
+
+
+def parse_ote_annual_zip(content: bytes, year: int) -> pd.DataFrame:
+    if len(content) > 30_000_000:
+        raise ValueError("ZIP OTE překračuje limit 30 MB.")
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            members = _ote_check_zip(archive)
+            candidates = {}
+            for item in members:
+                name = PurePosixPath(item.filename.replace("\\", "/")).name
+                normalized = _ote_normalize(name)
+                if (name.casefold().endswith(".xlsx") and "plyn" in normalized and "elektr" not in normalized
+                        and re.search(rf"(?<!\d){year}(?!\d)", normalized)):
+                    candidates[item.filename] = _ote_version(normalized)
+            selected = _ote_pick(candidates, year, "XLSX")
+            if selected is None:
+                raise ValueError(f"ZIP OTE neobsahuje plynový XLSX pro rok {year}.")
+            with archive.open(selected) as member:
+                workbook = member.read(30_000_001)
+        if len(workbook) > 30_000_000:
+            raise ValueError("XLSX OTE překračuje limit 30 MB.")
+        with ZipFile(BytesIO(workbook)) as inner:
+            _ote_check_zip(inner)
+        raw = pd.read_excel(BytesIO(workbook), sheet_name="Odchylky NC BAL", header=None, engine="openpyxl")
+    except (BadZipFile, OSError, RuntimeError, KeyError) as exc:
+        raise ValueError("Archiv nebo sešit OTE se nepodařilo přečíst: " + str(exc)[:200]) from exc
+    except ImportError as exc:
+        raise RuntimeError("Pro načtení roční zprávy OTE je nutná knihovna openpyxl.") from exc
+    first_data_row, date_column, price_column = _ote_header(raw)
+    data = raw.iloc[first_data_row:]
+    result = pd.DataFrame({"date": data.iloc[:, date_column].map(_ote_date),
+                           "price_czk_mwh": data.iloc[:, price_column].map(_ote_price)})
+    dated = result["date"].map(lambda value: pd.notna(value) and value.year == year)
+    raw_prices = data.iloc[:, price_column]
+    missing = raw_prices.map(lambda value: pd.isna(value) or str(value).strip().casefold() in {"", "nd", "n/a", "na", "nan", "none", "null", "-", "--", "—"})
+    if (dated & ~missing & ~result["price_czk_mwh"].map(math.isfinite)).any():
+        raise ValueError("Roční zpráva OTE obsahuje neplatnou nebo nekonečnou cenu pro plynárenský den.")
+    result = result.loc[result["date"].notna() & result["price_czk_mwh"].map(math.isfinite)].copy()
+    result["date"] = pd.to_datetime(result["date"]).dt.normalize()
+    result = result.loc[result["date"].dt.year.eq(year)]
+    if result.empty:
+        # A newly published current-year template may have dates but no prices yet.
+        known_dates = data.iloc[:, date_column].map(_ote_date).dropna()
+        if year == pd.Timestamp.now(tz="Europe/Prague").year and any(day.year == year for day in known_dates):
+            return pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"), "price_czk_mwh": pd.Series(dtype="float64")})
+        raise ValueError(f"Roční zpráva OTE neobsahuje platné denní ceny pro rok {year}.")
+    if (result.groupby("date")["price_czk_mwh"].nunique() > 1).any():
+        raise ValueError("Roční zpráva OTE obsahuje rozdílné ceny pro stejný plynárenský den.")
+    return result.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
+def _ote_download(url: str, limit: int, accept: str) -> bytes:
+    request = Request(_ote_url(url), headers={"User-Agent": "Mozilla/5.0 (compatible; HenryHubOTEReport/1.0)", "Accept": accept})
+    try:
+        with urlopen(request, timeout=20) as response:
+            content = response.read(limit + 1)
+        if len(content) > limit:
+            raise ValueError("Odpověď překračuje povolenou velikost.")
+        return content
+    except (HTTPError, URLError, OSError, ValueError) as exc:
+        raise RuntimeError("Data OTE se nepodařilo stáhnout: " + str(exc)[:250]) from exc
+
+
+def fetch_ote_annual_prices(year: int) -> pd.DataFrame | None:
+    page_url = OTE_ANNUAL_SOURCE_TEMPLATE.format(year=year)
+    body = _ote_download(page_url, 2_000_000, "text/html")
+    try:
+        html = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Roční stránka OTE neobsahuje platné UTF-8 HTML.") from exc
+    zip_url = find_ote_gas_zip_url(html, year, page_url)
+    if zip_url is None:
+        parser = _OteAnnualLinks()
+        parser.feed(html)
+        parser.close()
+        heading = _ote_normalize(" ".join(parser.title + parser.headings))
+        blocked = any(word in heading for word in ("access denied", "forbidden", "pristup odepren", "too many requests", "captcha"))
+        if blocked or "rocni zprava" not in heading:
+            raise ValueError("OTE nevrátilo rozpoznanou stránku roční zprávy; přístup mohl být odmítnut.")
+        return None
+    result = parse_ote_annual_zip(_ote_download(zip_url, 30_000_000, "application/zip"), year)
+    result["source_url"] = zip_url
+    return result
+
+CNB_YEARLY_RATE_TEMPLATE = (
+    "https://www.cnb.cz/cs/financni-trhy/devizovy-trh/kurzy-devizoveho-trhu/"
+    "kurzy-devizoveho-trhu/rok.txt?rok={year}"
+)
+_CNB_MAX_TEXT_BYTES = 2_000_000
+_CNB_MMBTU_PER_MWH = MMBTU_PER_MWH
+
+
+def _cnb_empty_rates() -> pd.DataFrame:
+    return pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
+                         "czk_per_usd": pd.Series(dtype="float64")})
+
+
+def _cnb_number(value, label: str, positive: bool = False) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label}: neplatná číselná hodnota.")
+    if isinstance(value, Real):
+        result = float(value)
+        if not math.isfinite(result) or (positive and result <= 0):
+            raise ValueError(f"{label}: hodnota musí být konečná" + (" a kladná." if positive else "."))
+        return result
+    text = str(value).strip().replace("\u00a0", "").replace(" ", "")
+    if not re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)", text):
+        raise ValueError(f"{label}: neplatná číselná hodnota {text[:60]!r}.")
+    result = float(text.replace(",", "."))
+    if not math.isfinite(result) or (positive and result <= 0):
+        raise ValueError(f"{label}: hodnota musí být konečná" + (" a kladná." if positive else "."))
+    return result
+
+
+def _cnb_price_date(value) -> pd.Timestamp:
+    # A gas-day label denotes a calendar day; never shift it to a UTC day.
+    if isinstance(value, (pd.Timestamp, datetime, date)) and not pd.isna(value):
+        result = pd.Timestamp(value)
+        if result.tzinfo is not None:
+            result = result.tz_localize(None)
+        return result.normalize()
+    if isinstance(value, str):
+        text = value.strip()
+        for pattern, fmt in ((r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),
+                             (r"\d{2}\.\d{2}\.\d{4}", "%d.%m.%Y")):
+            if re.fullmatch(pattern, text):
+                try:
+                    return pd.Timestamp(datetime.strptime(text, fmt))
+                except ValueError:
+                    break
+    raise ValueError(f"Neplatné datum plynového dne / kurzu ČNB: {str(value)[:60]!r}.")
+
+
+def _cnb_validate_rates(rates: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(rates, pd.DataFrame) or not {"date", "czk_per_usd"}.issubset(rates.columns):
+        raise ValueError("Tabulka kurzů ČNB musí mít sloupce date a czk_per_usd.")
+    if rates.empty:
+        return _cnb_empty_rates()
+    result = pd.DataFrame({
+        "date": [_cnb_price_date(value) for value in rates["date"]],
+        "czk_per_usd": [_cnb_number(value, "Kurz ČNB CZK/USD", positive=True)
+                        for value in rates["czk_per_usd"]],
+    })
+    if (result.groupby("date")["czk_per_usd"].nunique() > 1).any():
+        raise ValueError("ČNB obsahuje rozdílné kurzy USD pro stejné datum.")
+    return result.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
+def parse_cnb_usd_rates(text: str) -> pd.DataFrame:
+    """Parse annual CNB TXT, including a valid header-only (empty-year) table."""
+    if not isinstance(text, str) or len(text) > _CNB_MAX_TEXT_BYTES:
+        raise ValueError("ČNB nevrátila platný nebo přiměřeně velký textový soubor.")
+    lines = [line.strip() for line in text.lstrip("\ufeff\r\n \t").splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("Prázdná odpověď ČNB neobsahuje hlavičku roční tabulky.")
+    header = [cell.strip() for cell in lines[0].split("|")]
+    if not header or header[0].casefold() not in {"datum", "date"}:
+        raise ValueError("ČNB nevrátila roční tabulku kurzů (očekávám hlavičku Datum|…|USD).")
+    usd_columns = []
+    for index, name in enumerate(header[1:], start=1):
+        match = re.fullmatch(r"(\d+)\s+USD", name, flags=re.IGNORECASE)
+        if match:
+            amount = float(match.group(1))
+            if not math.isfinite(amount) or amount <= 0:
+                raise ValueError("ČNB má neplatné množství USD v hlavičce.")
+            usd_columns.append((index, amount))
+    if len(usd_columns) != 1:
+        raise ValueError("ČNB musí mít právě jeden sloupec s množstvím a kódem USD.")
+    usd_column, amount = usd_columns[0]
+    records = []
+    for line_number, line in enumerate(lines[1:], start=2):
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) != len(header):
+            raise ValueError(f"ČNB: neúplný nebo neplatný řádek {line_number}.")
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", cells[0]):
+            raise ValueError(f"ČNB: neplatné datum na řádku {line_number}.")
+        rate = _cnb_number(cells[usd_column], "Kurz ČNB USD", positive=True) / amount
+        records.append({"date": _cnb_price_date(cells[0]), "czk_per_usd": rate})
+    return _cnb_validate_rates(pd.DataFrame(records, columns=["date", "czk_per_usd"]))
+
+
+def fetch_cnb_usd_rates(year: int) -> pd.DataFrame:
+    """Download a single annual table; never interpret an error page as no fixings."""
+    if isinstance(year, bool) or not isinstance(year, int) or not 1991 <= year <= 9999:
+        raise ValueError("ČNB: rok musí být celé číslo od roku 1991.")
+    url = CNB_YEARLY_RATE_TEMPLATE.format(year=year)
+    request = Request(url, headers={"Accept": "text/plain",
+                                   "User-Agent": "HenryHubOTEReport/1.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "").casefold()
+            if "html" in content_type:
+                raise ValueError("ČNB vrátila HTML stránku místo roční tabulky kurzů.")
+            body = response.read(_CNB_MAX_TEXT_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Kurzy ČNB pro rok {year} se nepodařilo stáhnout: {exc}") from exc
+    if len(body) > _CNB_MAX_TEXT_BYTES:
+        raise ValueError(f"Odpověď ČNB pro rok {year} překročila velikostní limit.")
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"ČNB pro rok {year} nevrátila platný text UTF-8.") from exc
+    result = parse_cnb_usd_rates(text)
+    if not result.empty and not result["date"].dt.year.eq(year).all():
+        raise ValueError(f"ČNB pro rok {year} vrátila kurzy z jiného roku.")
+    result.attrs["source_url"] = url
+    return result
+
+
+def convert_ote_czk_to_usd(prices: pd.DataFrame) -> pd.DataFrame:
+    """Use the same-day or latest earlier CNB fixing, preserving input row order.
+
+    Downloads each required year at most once in this call. When the first gas
+    day of a year precedes that year's first fixing, also downloads the previous
+    year. Missing coverage fails explicitly rather than using a future fixing.
+    """
+    if not isinstance(prices, pd.DataFrame) or not {"date", "price_czk_mwh"}.issubset(prices.columns):
+        raise ValueError("Ceny OTE musí mít sloupce date a price_czk_mwh.")
+    result = prices.copy()
+    if result.empty:
+        result["date"] = pd.Series(index=result.index, dtype="datetime64[ns]")
+        for column in ("price_mwh", "price_mmbtu", "czk_per_usd"):
+            result[column] = pd.Series(index=result.index, dtype="float64")
+        result["cnb_rate_date"] = pd.Series(index=result.index, dtype="datetime64[ns]")
+        return result
+    dates = pd.DatetimeIndex([_cnb_price_date(value) for value in result["date"]])
+    czk_prices = [_cnb_number(value, "Cena OTE v CZK/MWh") for value in result["price_czk_mwh"]]
+    lookups = pd.DataFrame({"date": dates, "_position": range(len(result))})
+    yearly = {}
+
+    def load_year(year: int) -> pd.DataFrame:
+        if year not in yearly:
+            yearly[year] = _cnb_validate_rates(fetch_cnb_usd_rates(year))
+            if not yearly[year].empty and not yearly[year]["date"].dt.year.eq(year).all():
+                raise ValueError(f"ČNB pro rok {year} vrátila kurzy z jiného roku.")
+        return yearly[year]
+
+    for year in sorted(set(dates.year)):
+        year = int(year)
+        first_day = dates[dates.year == year].min()
+        rates = load_year(year)
+        if not rates["date"].le(first_day).any():
+            if year <= 1991:
+                raise ValueError(f"Pro {first_day:%d.%m.%Y} není k dispozici předchozí kurz ČNB USD.")
+            previous = load_year(year - 1)
+            if not previous["date"].le(first_day).any():
+                raise ValueError(f"Pro {first_day:%d.%m.%Y} chybí stejný nebo předchozí kurz ČNB USD.")
+    all_rates = _cnb_validate_rates(pd.concat(list(yearly.values()), ignore_index=True))
+    aligned = pd.merge_asof(lookups.sort_values("date"),
+                            all_rates.rename(columns={"date": "cnb_rate_date"}),
+                            left_on="date", right_on="cnb_rate_date", direction="backward",
+                            allow_exact_matches=True).sort_values("_position")
+    if aligned["czk_per_usd"].isna().any():
+        raise ValueError("Pro některý plynový den OTE není k dispozici stejný nebo předchozí kurz ČNB USD.")
+    result["date"] = dates.to_numpy()
+    result["czk_per_usd"] = aligned["czk_per_usd"].to_numpy()
+    result["cnb_rate_date"] = aligned["cnb_rate_date"].to_numpy()
+    result["price_mwh"] = pd.Series(czk_prices, dtype="float64").to_numpy() / result["czk_per_usd"].to_numpy()
+    result["price_mmbtu"] = result["price_mwh"] / _CNB_MMBTU_PER_MWH
+    return result
+
+_OTE_USD_MWH = "Spotová cena plynu OTE (USD/MWh)"
+_OTE_USD_MMBTU = "Spotová cena plynu OTE (USD/MMBtu)"
+_OTE_CZK_MWH = "Spotová cena plynu OTE (Kč/MWh)"
+_OTE_CNB_RATE = "Kurz ČNB (Kč/USD)"
+_OTE_CNB_DATE = "Datum kurzu ČNB"
+_OTE_SOURCE = "Zdroj nových dat OTE"
+_OTE_MMBTU_PER_MWH = MMBTU_PER_MWH
+_OTE_XML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+
+def _ote_workbook_number(value):
+    """Finite stored price, including zero and negative prices; None if missing."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip().replace("\u00a0", "").replace(" ", "")
+        if "," in value and "." not in value:
+            value = value.replace(",", ".")
+        elif "," in value:
+            value = value.replace(",", "")
+    try:
+        result = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _ote_workbook_date(value, epoch=None):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return None if pd.isna(value) else value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        if epoch is None or not math.isfinite(float(value)):
+            return None
+        try:
+            parsed = from_excel(value, epoch)
+            return parsed.date() if isinstance(parsed, datetime) else parsed if isinstance(parsed, date) else None
+        except (ValueError, OverflowError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    for pattern in ("%d.%m.%Y", "%d. %m. %Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _ote_sheet_xml_paths(archive):
+    ns = {"m": _OTE_XML_NS}
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    doc_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets = {node.get("Id"): node.get("Target") for node in rels.findall(f"{{{rel_ns}}}Relationship")}
+    book = ET.fromstring(archive.read("xl/workbook.xml"))
+    result = {}
+    for sheet in book.findall("m:sheets/m:sheet", ns):
+        target = targets.get(sheet.get(f"{{{doc_rel_ns}}}id"))
+        if target:
+            result[sheet.get("name")] = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+    return result
+
+
+def _ote_restore_formula_caches(original_bytes, staged_path, changed_cells):
+    """openpyxl drops cached formula results; retain caches of untouched formulas."""
+    replacements = {}
+    ns = "{" + _OTE_XML_NS + "}"
+    with ZipFile(BytesIO(original_bytes)) as original, ZipFile(staged_path) as staged:
+        old_paths, new_paths = _ote_sheet_xml_paths(original), _ote_sheet_xml_paths(staged)
+        for name, old_path in old_paths.items():
+            new_path = new_paths.get(name)
+            if not new_path:
+                continue
+            old_root = ET.fromstring(original.read(old_path))
+            cached = {cell.get("r"): cell for cell in old_root.iter(ns + "c")
+                      if cell.find(ns + "f") is not None and cell.find(ns + "v") is not None
+                      and cell.find(ns + "v").text is not None}
+            if not cached:
+                continue
+            new_root = ET.fromstring(staged.read(new_path))
+            modified = False
+            for cell in new_root.iter(ns + "c"):
+                coord = cell.get("r")
+                old_cell = cached.get(coord)
+                if old_cell is None or (name, coord) in changed_cells or cell.find(ns + "f") is None:
+                    continue
+                # The updater never edits formula definitions. Shared formulas may
+                # be expanded by openpyxl, so match their unchanged cell identity.
+                for existing in list(cell):
+                    if existing.tag in (ns + "v", ns + "is"):
+                        cell.remove(existing)
+                cell.append(copy(old_cell.find(ns + "v")))
+                if "t" in old_cell.attrib:
+                    cell.set("t", old_cell.get("t"))
+                else:
+                    cell.attrib.pop("t", None)
+                modified = True
+            if modified:
+                replacements[new_path] = ET.tostring(new_root, encoding="utf-8")
+        if replacements:
+            stream = BytesIO()
+            with ZipFile(stream, "w") as rebuilt:
+                for info in staged.infolist():
+                    rebuilt.writestr(info, replacements.get(info.filename, staged.read(info.filename)))
+    if replacements:
+        staged_path.write_bytes(stream.getvalue())
+
+
+def _ote_workbook_new_data(annual_fetcher, cutoff, today, notes):
+    pieces = []
+    for year in range((cutoff + timedelta(days=1)).year, today.year + 1):
+        frame = annual_fetcher(year)
+        if frame is None:
+            if year == today.year:
+                notes.append(f"Roční soubor OTE pro rok {year} zatím nezveřejněno; doplněna jsou pouze dostupná data.")
+                continue
+            raise ValueError(f"Roční soubor OTE pro potřebný rok {year} není dostupný.")
+        if not isinstance(frame, pd.DataFrame) or not {"date", "price_czk_mwh", "source_url"}.issubset(frame.columns):
+            raise ValueError(f"Roční data OTE pro rok {year} nemají sloupce date, price_czk_mwh a source_url.")
+        for record in frame.to_dict("records"):
+            day = _ote_workbook_date(record["date"])
+            if day is None:
+                raise ValueError(f"Roční data OTE pro rok {year} obsahují neplatné datum.")
+            if not cutoff < day <= today:
+                continue
+            if day.year != year:
+                raise ValueError(f"Roční data OTE pro rok {year} obsahují datum z jiného roku: {day}.")
+            price = _ote_workbook_number(record["price_czk_mwh"])
+            source = record["source_url"]
+            if price is None or not isinstance(source, str) or not source.strip():
+                raise ValueError(f"OTE nevrátilo platnou cenu nebo zdroj pro {day}.")
+            pieces.append({"date": day, "price_czk_mwh": price, "source_url": source.strip()})
+    if not pieces:
+        return pd.DataFrame(columns=["date", "price_czk_mwh", "source_url"])
+    data = pd.DataFrame(pieces)
+    if (data.groupby("date")["price_czk_mwh"].nunique() > 1).any():
+        raise ValueError("OTE vrátilo rozdílné ceny pro stejný nový den.")
+    return data.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
+def _ote_workbook_converted(currency_converter, source):
+    converted = currency_converter(source.copy(deep=True))
+    required = {"date", "price_mwh", "price_mmbtu", "czk_per_usd", "cnb_rate_date"}
+    if not isinstance(converted, pd.DataFrame) or not required.issubset(converted.columns):
+        raise ValueError("Převod OTE do USD nevrátil všechny požadované cenové a kurzové sloupce.")
+    by_date = {row["date"]: row for row in source.to_dict("records")}
+    result = []
+    for row in converted.to_dict("records"):
+        day = _ote_workbook_date(row["date"])
+        if day not in by_date:
+            raise ValueError("Převod OTE do USD vrátil nečekané datum.")
+        values = {key: _ote_workbook_number(row[key]) for key in ("price_mwh", "price_mmbtu", "czk_per_usd")}
+        rate_date = _ote_workbook_date(row["cnb_rate_date"])
+        if any(value is None for value in values.values()) or values["czk_per_usd"] <= 0 or rate_date is None or rate_date > day:
+            raise ValueError(f"Chybí platná cena USD nebo kurz ČNB pro {day}.")
+        original = by_date[day]
+        if not math.isclose(values["price_mwh"], original["price_czk_mwh"] / values["czk_per_usd"], rel_tol=1e-7, abs_tol=1e-7):
+            raise ValueError(f"Cena OTE v USD/MWh neodpovídá ceně Kč/MWh a kurzu ČNB pro {day}.")
+        if not math.isclose(values["price_mmbtu"], values["price_mwh"] / _OTE_MMBTU_PER_MWH, rel_tol=1e-7, abs_tol=1e-7):
+            raise ValueError(f"Cena OTE v USD/MMBtu neodpovídá převodu jednotek pro {day}.")
+        result.append({**original, **values, "cnb_rate_date": rate_date})
+    if len(result) != len(by_date) or len({row["date"] for row in result}) != len(by_date):
+        raise ValueError("Převod OTE do USD nevrátil právě jeden záznam pro každý nový den.")
+    return sorted(result, key=lambda row: row["date"])
+
+
+def update_ote_workbook(path: Path, *, today: date | None = None, annual_fetcher=None, currency_converter=None) -> dict:
+    """Extend original OTE XLSX; leave history unchanged and back it up on success.
+
+    Injected fetcher(year) supplies date/price_czk_mwh/source_url. The converter
+    preserves those rows and adds USD price_mwh/price_mmbtu plus ČNB metadata.
+    """
+    path = Path(path)
+    today = _ote_workbook_date(today) if today is not None else pd.Timestamp.now(tz="Europe/Prague").date()
+    if today is None:
+        raise ValueError("Neplatné datum konce aktualizace OTE.")
+    original_bytes = path.read_bytes()
+    wb = load_workbook(BytesIO(original_bytes), data_only=False)
+    cached = load_workbook(BytesIO(original_bytes), read_only=True, data_only=True)
+    try:
+        ws, values_ws = wb.worksheets[0], cached.worksheets[0]
+        headers = {str(cell.value).strip().casefold(): cell.column for cell in ws[1] if cell.value is not None}
+        date_col = headers.get("date")
+        price_cols = [headers[name.casefold()] for name in (_OTE_USD_MWH, _OTE_USD_MMBTU) if name.casefold() in headers]
+        if date_col is None or not price_cols:
+            raise ValueError("První list OTE musí obsahovat Date a alespoň jeden cenový sloupec USD/MWh nebo USD/MMBtu.")
+        rows_by_date, valid_rows = {}, []
+        for row_index, cells in enumerate(values_ws.iter_rows(min_row=2, max_col=max(date_col, *price_cols)), 2):
+            day = _ote_workbook_date(cells[date_col - 1].value, wb.epoch)
+            has_price = any(_ote_workbook_number(cells[column - 1].value) is not None for column in price_cols)
+            if has_price and day is None:
+                raise ValueError(f"Řádek {row_index} OTE má cenu, ale neplatné datum Date.")
+            if day is not None:
+                rows_by_date.setdefault(day, []).append(row_index)
+                if has_price:
+                    valid_rows.append((day, row_index))
+        last_date = max((day for day, _ in valid_rows), default=None)
+        cutoff = last_date or ((min(rows_by_date) if rows_by_date else date(today.year, 1, 1)) - timedelta(days=1))
+    finally:
+        cached.close()
+        wb.close()
+    status = {"added_rows": 0, "updated_rows": 0, "last_date": last_date.isoformat() if last_date else None,
+              "backup_path": None, "notes": []}
+    if cutoff >= today:
+        return status
+    if annual_fetcher is None:
+        annual_fetcher = fetch_ote_annual_prices
+    incoming = _ote_workbook_new_data(annual_fetcher, cutoff, today, status["notes"])
+    if incoming.empty:
+        return status
+    if currency_converter is None:
+        currency_converter = convert_ote_czk_to_usd
+    converted = _ote_workbook_converted(currency_converter, incoming)
+    # Confirm every reusable row is actually empty before changing any cells.
+    placements = []
+    for record in converted:
+        day = record["date"]
+        matching = rows_by_date.get(day, [])
+        if matching:
+            target = matching[0]
+            for column in price_cols:
+                cell = ws.cell(target, column)
+                if cell.data_type == "f" or (cell.value is not None and str(cell.value).strip().upper() not in {"", "-", "—", "N/A", "ND", "NAN"}):
+                    raise ValueError(f"Řádek OTE pro {day} obsahuje nevyhodnocenou cenu nebo vzorec; nebyl přepsán.")
+            placements.append((record, target))
+        else:
+            placements.append((record, None))
+    all_headers = (_OTE_USD_MWH, _OTE_USD_MMBTU, _OTE_CZK_MWH, _OTE_CNB_RATE, _OTE_CNB_DATE, _OTE_SOURCE)
+    for name in all_headers:
+        if name.casefold() not in headers:
+            column = ws.max_column + 1
+            previous = ws.cell(1, column - 1)
+            cell = ws.cell(1, column, name)
+            if previous.has_style:
+                cell._style = copy(previous._style)
+            headers[name.casefold()] = column
+    changed_cells = set()
+    style_row = max(valid_rows, key=lambda item: (item[0], item[1]))[1] if valid_rows else None
+    for record, target in placements:
+        is_new = target is None
+        target = ws.max_row + 1 if is_new else target
+        if is_new:
+            ws.cell(target, date_col, record["date"])
+            changed_cells.add((ws.title, ws.cell(target, date_col).coordinate))
+        values = {_OTE_USD_MWH: record["price_mwh"], _OTE_USD_MMBTU: record["price_mmbtu"],
+                  _OTE_CZK_MWH: record["price_czk_mwh"], _OTE_CNB_RATE: record["czk_per_usd"],
+                  _OTE_CNB_DATE: record["cnb_rate_date"], _OTE_SOURCE: record["source_url"]}
+        for name, value in values.items():
+            column = headers[name.casefold()]
+            cell = ws.cell(target, column, value)
+            if not cell.has_style and style_row is not None and ws.cell(style_row, column).has_style:
+                cell._style = copy(ws.cell(style_row, column)._style)
+            if name == _OTE_CNB_DATE:
+                cell.number_format = "yyyy-mm-dd"
+            elif name == _OTE_SOURCE:
+                cell.data_type = "s"
+            changed_cells.add((ws.title, cell.coordinate))
+        if is_new:
+            date_cell = ws.cell(target, date_col)
+            if style_row is not None:
+                date_cell._style = copy(ws.cell(style_row, date_col)._style)
+            if not is_date_format(date_cell.number_format):
+                date_cell.number_format = "yyyy-mm-dd"
+        status["added_rows" if is_new else "updated_rows"] += 1
+    staged_path = backup_path = None
+    committed = False
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".ote-update-", suffix=path.suffix, dir=path.parent, delete=False) as temporary:
+            staged_path = Path(temporary.name)
+        wb.save(staged_path)
+        wb.close()
+        _ote_restore_formula_caches(original_bytes, staged_path, changed_cells)
+        shutil.copymode(path, staged_path)
+        if path.read_bytes() != original_bytes:
+            raise RuntimeError("Soubor OTE se během aktualizace změnil; nebyl přepsán.")
+        with tempfile.NamedTemporaryFile(prefix=path.stem + ".backup-", suffix=path.suffix, dir=path.parent, delete=False) as temporary:
+            backup_path = Path(temporary.name)
+        shutil.copy2(path, backup_path)
+        os.replace(staged_path, path)
+        committed = True
+    finally:
+        wb.close()
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+        if not committed and backup_path is not None:
+            backup_path.unlink(missing_ok=True)
+    status["last_date"] = converted[-1]["date"].isoformat()
+    status["backup_path"] = str(backup_path)
+    return status
 
 
 def read_ote(path: Path) -> pd.DataFrame:
@@ -1743,7 +2495,7 @@ html { scroll-behavior: smooth; scroll-padding-top: var(--header-height, 210px);
   <div class="pdf-actions"><button id="pdfCancel" type="button">Zrušit</button><button id="pdfConfirm" type="button">Exportovat</button></div>
 </dialog>
 <div class="wrap">
-  <div class="panel"><p>Srovnání amerického Henry Hub a českého trhu OTE. Henry Hub se načítá z listu Data 1 souboru <a href="https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm" target="_blank" rel="noopener noreferrer">EIA</a>; OTE z prvního listu místního Excelu. Porovnání používá pouze společné kalendářní dny. Více cen ve stejném dni se zprůměruje.</p><p class="small">1 MWh = 3,4121416 MMBtu. OTE − HH: kladný rozdíl znamená dražší OTE. Přepnutí měny převádí grafy i cenové statistiky. EUR = USD / Rate z <a href="https://www.federalreserve.gov/RELEASES/H10/hist/dat00_eu.htm" target="_blank" rel="noopener noreferrer">Federal Reserve</a> (počet USD za 1 EUR). Chybějící den včetně ND se doplní průměrem nejbližšího předchozího a následujícího dostupného kurzu. Před 3. 1. 2000 se použije kurz z 3. 1. 2000; po posledním dostupném dni (__FX_END__) poslední zveřejněný kurz. Trendy, výnosy a statistiky se počítají z převedených denních cen. Přepínače platí pro všechny čtyři sekce.</p></div>
+  <div class="panel"><p>Srovnání amerického Henry Hub a českého trhu OTE. Henry Hub se načítá z listu Data 1 souboru <a href="https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm" target="_blank" rel="noopener noreferrer">EIA</a>; OTE z prvního listu původního Excelu, do kterého se při vytváření reportu doplňují novější dny z ročních zpráv OTE. Porovnání používá pouze společné kalendářní dny. Více cen ve stejném dni se zprůměruje.</p><p class="small">1 MWh = 3,4121416 MMBtu. OTE − HH: kladný rozdíl znamená dražší OTE. Přepnutí měny převádí grafy i cenové statistiky. EUR = USD / Rate z <a href="https://www.federalreserve.gov/RELEASES/H10/hist/dat00_eu.htm" target="_blank" rel="noopener noreferrer">Federal Reserve</a> (počet USD za 1 EUR). Chybějící den včetně ND se doplní průměrem nejbližšího předchozího a následujícího dostupného kurzu. Před 3. 1. 2000 se použije kurz z 3. 1. 2000; po posledním dostupném dni (__FX_END__) poslední zveřejněný kurz. Trendy, výnosy a statistiky se počítají z převedených denních cen. Přepínače platí pro všechny čtyři sekce.</p></div>
 
   <div class="panel" id="hh-section">
     <h2 class="section-title">1. Henry Hub - spotové ceny plynu</h2>
@@ -1779,6 +2531,7 @@ html { scroll-behavior: smooth; scroll-padding-top: var(--header-height, 210px);
 
   <div class="panel" id="ote-section">
     <h2 class="section-title">2. OTE – spotové ceny plynu</h2>
+    <p class="small">Poslední den OTE v reportu: <strong>__OTE_END__</strong>. Nově doplněné ceny NC BAL v Kč/MWh se převádějí na USD podle stejného nebo posledního předchozího kurzu ČNB. Roční zpráva V0 je zveřejňována průběžně do D−3.</p>
     __OTE_KPI__
     <div class="controls">
       <div class="row"><span class="label">Zobrazení</span>
@@ -2497,6 +3250,7 @@ document.getElementById('pdfConfirm').addEventListener('click', async () => {
         "__LOGO__": LOGO_DATA_URI,
         "__PRINT_LOGO__": PRINT_LOGO_DATA_URI,
         "__FX_END__": eur["fx_end"],
+        "__OTE_END__": ote_prepared["daily"]["date"].max().strftime("%d.%m.%Y"),
         "__FIGURE_SETS__": json.dumps(figure_sets, cls=PlotlyJSONEncoder),
         "__PLOTLY_JS__": get_plotlyjs(),
         "__HH_KPI__": "".join(kpis["hh"]),
@@ -2546,9 +3300,20 @@ def main() -> None:
     parser.add_argument("--output", default=OUTPUT_DEFAULT, help="Výstupní HTML soubor")
     args = parser.parse_args([]) if "ipykernel" in sys.modules else parser.parse_args()
 
+    ote_path = resolve_input(args.ote_input)
+    print("Doplňuji původní Excel OTE z ročních zpráv (Europe/Prague)...")
+    ote_update = update_ote_workbook(ote_path)
+    for note in ote_update["notes"]:
+        print("OTE: " + note)
+    last_ote = pd.Timestamp(ote_update["last_date"]).strftime("%d.%m.%Y") if ote_update["last_date"] else "bez dat"
+    if ote_update["added_rows"] or ote_update["updated_rows"]:
+        print(f"OTE: přidáno {ote_update['added_rows']} řádků, doplněno {ote_update['updated_rows']} připravených řádků; data do {last_ote}.")
+        print(f"Záloha původního OTE souboru: {ote_update['backup_path']}")
+    else:
+        print(f"OTE: nejsou dostupná novější data; soubor nebyl změněn. Poslední den: {last_ote}.")
     print("Stahuji denní spotové ceny Henry Hub z EIA (list Data 1)...")
     hh_prices = read_henry_hub()
-    ote_prices = read_ote(resolve_input(args.ote_input))
+    ote_prices = read_ote(ote_path)
 
     print("Připravuji data Henry Hub...")
     hh_prepared = prepare_market(hh_prices)
